@@ -4,3 +4,4 @@
 *.orig
 .env
 .env.*
+*.md
