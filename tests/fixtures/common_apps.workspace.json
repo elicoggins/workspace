@@ -30,10 +30,25 @@
       "bundle_id": "com.microsoft.VSCode",
       "pid": 1001,
       "title": "workspace-cli",
-      "frame": { "x": 0.0, "y": 33.0, "width": 1470.0, "height": 833.0 },
+      "frame": {
+        "x": 0.0,
+        "y": 33.0,
+        "width": 1470.0,
+        "height": 833.0
+      },
       "display_id": "cgdisplay-1",
-      "display_frame": { "x": 0.0, "y": 0.0, "width": 1470.0, "height": 956.0 },
-      "display_relative_frame": { "x": 0.0, "y": 0.0345188285, "width": 1.0, "height": 0.8713389121 },
+      "display_frame": {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1470.0,
+        "height": 956.0
+      },
+      "display_relative_frame": {
+        "x": 0.0,
+        "y": 0.0345188285,
+        "width": 1.0,
+        "height": 0.8713389121
+      },
       "z_order": 0,
       "fullscreen": false,
       "minimized": false
@@ -45,16 +60,39 @@
       "bundle_id": "com.google.Chrome",
       "pid": 1002,
       "title": "Docs",
-      "frame": { "x": 0.0, "y": 33.0, "width": 1470.0, "height": 833.0 },
+      "frame": {
+        "x": 0.0,
+        "y": 33.0,
+        "width": 1470.0,
+        "height": 833.0
+      },
       "display_id": "cgdisplay-1",
-      "display_frame": { "x": 0.0, "y": 0.0, "width": 1470.0, "height": 956.0 },
-      "display_relative_frame": { "x": 0.0, "y": 0.0345188285, "width": 1.0, "height": 0.8713389121 },
+      "display_frame": {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1470.0,
+        "height": 956.0
+      },
+      "display_relative_frame": {
+        "x": 0.0,
+        "y": 0.0345188285,
+        "width": 1.0,
+        "height": 0.8713389121
+      },
       "z_order": 1,
       "fullscreen": false,
       "minimized": false,
       "browser_tabs": [
-        { "title": "Rust", "url": "https://www.rust-lang.org/", "active": true },
-        { "title": "Cargo", "url": "https://doc.rust-lang.org/cargo/", "active": false }
+        {
+          "title": "Rust",
+          "url": "https://www.rust-lang.org/",
+          "active": true
+        },
+        {
+          "title": "Cargo",
+          "url": "https://doc.rust-lang.org/cargo/",
+          "active": false
+        }
       ]
     },
     {
@@ -64,15 +102,34 @@
       "bundle_id": "com.google.Chrome",
       "pid": 1002,
       "title": "Issue Tracker",
-      "frame": { "x": 40.0, "y": 60.0, "width": 1320.0, "height": 760.0 },
+      "frame": {
+        "x": 40.0,
+        "y": 60.0,
+        "width": 1320.0,
+        "height": 760.0
+      },
       "display_id": "cgdisplay-1",
-      "display_frame": { "x": 0.0, "y": 0.0, "width": 1470.0, "height": 956.0 },
-      "display_relative_frame": { "x": 0.0272108844, "y": 0.0627615063, "width": 0.8979591837, "height": 0.7949790795 },
+      "display_frame": {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1470.0,
+        "height": 956.0
+      },
+      "display_relative_frame": {
+        "x": 0.0272108844,
+        "y": 0.0627615063,
+        "width": 0.8979591837,
+        "height": 0.7949790795
+      },
       "z_order": 2,
       "fullscreen": false,
       "minimized": false,
       "browser_tabs": [
-        { "title": "Issues", "url": "https://github.com/issues", "active": true }
+        {
+          "title": "Issues",
+          "url": "https://github.com/issues",
+          "active": true
+        }
       ]
     },
     {
@@ -82,16 +139,39 @@
       "bundle_id": "com.google.Chrome",
       "pid": 1002,
       "title": "Reference",
-      "frame": { "x": 120.0, "y": 110.0, "width": 1100.0, "height": 720.0 },
+      "frame": {
+        "x": 120.0,
+        "y": 110.0,
+        "width": 1100.0,
+        "height": 720.0
+      },
       "display_id": "cgdisplay-1",
-      "display_frame": { "x": 0.0, "y": 0.0, "width": 1470.0, "height": 956.0 },
-      "display_relative_frame": { "x": 0.0816326531, "y": 0.1150627615, "width": 0.7482993197, "height": 0.7531380753 },
+      "display_frame": {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1470.0,
+        "height": 956.0
+      },
+      "display_relative_frame": {
+        "x": 0.0816326531,
+        "y": 0.1150627615,
+        "width": 0.7482993197,
+        "height": 0.7531380753
+      },
       "z_order": 3,
       "fullscreen": false,
       "minimized": false,
       "browser_tabs": [
-        { "title": "Example", "url": "https://example.com/", "active": false },
-        { "title": "MDN", "url": "https://developer.mozilla.org/", "active": true }
+        {
+          "title": "Example",
+          "url": "https://example.com/",
+          "active": false
+        },
+        {
+          "title": "MDN",
+          "url": "https://developer.mozilla.org/",
+          "active": true
+        }
       ]
     },
     {
@@ -101,10 +181,25 @@
       "bundle_id": "com.apple.Terminal",
       "pid": 1003,
       "title": "shell",
-      "frame": { "x": 100.0, "y": 100.0, "width": 900.0, "height": 600.0 },
+      "frame": {
+        "x": 100.0,
+        "y": 100.0,
+        "width": 900.0,
+        "height": 600.0
+      },
       "display_id": "cgdisplay-1",
-      "display_frame": { "x": 0.0, "y": 0.0, "width": 1470.0, "height": 956.0 },
-      "display_relative_frame": { "x": 0.0680272109, "y": 0.1046025105, "width": 0.612244898, "height": 0.6276150628 },
+      "display_frame": {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1470.0,
+        "height": 956.0
+      },
+      "display_relative_frame": {
+        "x": 0.0680272109,
+        "y": 0.1046025105,
+        "width": 0.612244898,
+        "height": 0.6276150628
+      },
       "z_order": 4,
       "fullscreen": false,
       "minimized": false
@@ -116,10 +211,25 @@
       "bundle_id": "com.apple.Music",
       "pid": 1004,
       "title": null,
-      "frame": { "x": 219.0, "y": 179.0, "width": 980.0, "height": 600.0 },
+      "frame": {
+        "x": 219.0,
+        "y": 179.0,
+        "width": 980.0,
+        "height": 600.0
+      },
       "display_id": "cgdisplay-1",
-      "display_frame": { "x": 0.0, "y": 0.0, "width": 1470.0, "height": 956.0 },
-      "display_relative_frame": { "x": 0.1489795918, "y": 0.1872384937, "width": 0.6666666667, "height": 0.6276150628 },
+      "display_frame": {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1470.0,
+        "height": 956.0
+      },
+      "display_relative_frame": {
+        "x": 0.1489795918,
+        "y": 0.1872384937,
+        "width": 0.6666666667,
+        "height": 0.6276150628
+      },
       "z_order": 5,
       "fullscreen": false,
       "minimized": false
@@ -131,10 +241,25 @@
       "bundle_id": "com.apple.Safari",
       "pid": 1005,
       "title": "Apple",
-      "frame": { "x": 80.0, "y": 60.0, "width": 1200.0, "height": 780.0 },
+      "frame": {
+        "x": 80.0,
+        "y": 60.0,
+        "width": 1200.0,
+        "height": 780.0
+      },
       "display_id": "cgdisplay-1",
-      "display_frame": { "x": 0.0, "y": 0.0, "width": 1470.0, "height": 956.0 },
-      "display_relative_frame": { "x": 0.0544217687, "y": 0.0627615063, "width": 0.8163265306, "height": 0.8158995816 },
+      "display_frame": {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1470.0,
+        "height": 956.0
+      },
+      "display_relative_frame": {
+        "x": 0.0544217687,
+        "y": 0.0627615063,
+        "width": 0.8163265306,
+        "height": 0.8158995816
+      },
       "z_order": 6,
       "fullscreen": false,
       "minimized": false
@@ -146,10 +271,25 @@
       "bundle_id": "com.googlecode.iterm2",
       "pid": 1006,
       "title": "workspace-cli",
-      "frame": { "x": 120.0, "y": 120.0, "width": 960.0, "height": 620.0 },
+      "frame": {
+        "x": 120.0,
+        "y": 120.0,
+        "width": 960.0,
+        "height": 620.0
+      },
       "display_id": "cgdisplay-1",
-      "display_frame": { "x": 0.0, "y": 0.0, "width": 1470.0, "height": 956.0 },
-      "display_relative_frame": { "x": 0.0816326531, "y": 0.1255230126, "width": 0.6530612245, "height": 0.6485355649 },
+      "display_frame": {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1470.0,
+        "height": 956.0
+      },
+      "display_relative_frame": {
+        "x": 0.0816326531,
+        "y": 0.1255230126,
+        "width": 0.6530612245,
+        "height": 0.6485355649
+      },
       "z_order": 7,
       "fullscreen": false,
       "minimized": false
@@ -161,10 +301,25 @@
       "bundle_id": "dev.warp.Warp-Stable",
       "pid": 1007,
       "title": "workspace-cli",
-      "frame": { "x": 140.0, "y": 140.0, "width": 940.0, "height": 600.0 },
+      "frame": {
+        "x": 140.0,
+        "y": 140.0,
+        "width": 940.0,
+        "height": 600.0
+      },
       "display_id": "cgdisplay-1",
-      "display_frame": { "x": 0.0, "y": 0.0, "width": 1470.0, "height": 956.0 },
-      "display_relative_frame": { "x": 0.0952380952, "y": 0.1464435146, "width": 0.6394557823, "height": 0.6276150628 },
+      "display_frame": {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1470.0,
+        "height": 956.0
+      },
+      "display_relative_frame": {
+        "x": 0.0952380952,
+        "y": 0.1464435146,
+        "width": 0.6394557823,
+        "height": 0.6276150628
+      },
       "z_order": 8,
       "fullscreen": false,
       "minimized": false
@@ -176,10 +331,25 @@
       "bundle_id": "com.todesktop.230313mzl4w4u92",
       "pid": 1008,
       "title": "workspace-cli",
-      "frame": { "x": 40.0, "y": 40.0, "width": 1300.0, "height": 820.0 },
+      "frame": {
+        "x": 40.0,
+        "y": 40.0,
+        "width": 1300.0,
+        "height": 820.0
+      },
       "display_id": "cgdisplay-1",
-      "display_frame": { "x": 0.0, "y": 0.0, "width": 1470.0, "height": 956.0 },
-      "display_relative_frame": { "x": 0.0272108844, "y": 0.0418410042, "width": 0.8843537415, "height": 0.8577405858 },
+      "display_frame": {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1470.0,
+        "height": 956.0
+      },
+      "display_relative_frame": {
+        "x": 0.0272108844,
+        "y": 0.0418410042,
+        "width": 0.8843537415,
+        "height": 0.8577405858
+      },
       "z_order": 9,
       "fullscreen": false,
       "minimized": false
@@ -191,10 +361,25 @@
       "bundle_id": "com.apple.dt.Xcode",
       "pid": 1009,
       "title": "Workspace.xcodeproj",
-      "frame": { "x": 64.0, "y": 64.0, "width": 1280.0, "height": 790.0 },
+      "frame": {
+        "x": 64.0,
+        "y": 64.0,
+        "width": 1280.0,
+        "height": 790.0
+      },
       "display_id": "cgdisplay-1",
-      "display_frame": { "x": 0.0, "y": 0.0, "width": 1470.0, "height": 956.0 },
-      "display_relative_frame": { "x": 0.043537415, "y": 0.0669456067, "width": 0.8707482993, "height": 0.8263598326 },
+      "display_frame": {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1470.0,
+        "height": 956.0
+      },
+      "display_relative_frame": {
+        "x": 0.043537415,
+        "y": 0.0669456067,
+        "width": 0.8707482993,
+        "height": 0.8263598326
+      },
       "z_order": 10,
       "fullscreen": false,
       "minimized": false
@@ -206,10 +391,25 @@
       "bundle_id": "com.apple.finder",
       "pid": 1010,
       "title": "Documents",
-      "frame": { "x": 180.0, "y": 120.0, "width": 840.0, "height": 620.0 },
+      "frame": {
+        "x": 180.0,
+        "y": 120.0,
+        "width": 840.0,
+        "height": 620.0
+      },
       "display_id": "cgdisplay-1",
-      "display_frame": { "x": 0.0, "y": 0.0, "width": 1470.0, "height": 956.0 },
-      "display_relative_frame": { "x": 0.1224489796, "y": 0.1255230126, "width": 0.5714285714, "height": 0.6485355649 },
+      "display_frame": {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1470.0,
+        "height": 956.0
+      },
+      "display_relative_frame": {
+        "x": 0.1224489796,
+        "y": 0.1255230126,
+        "width": 0.5714285714,
+        "height": 0.6485355649
+      },
       "z_order": 11,
       "fullscreen": false,
       "minimized": false
@@ -221,10 +421,25 @@
       "bundle_id": "com.apple.Notes",
       "pid": 1011,
       "title": "Notes",
-      "frame": { "x": 131.0, "y": 115.0, "width": 1120.0, "height": 702.0 },
+      "frame": {
+        "x": 131.0,
+        "y": 115.0,
+        "width": 1120.0,
+        "height": 702.0
+      },
       "display_id": "cgdisplay-1",
-      "display_frame": { "x": 0.0, "y": 0.0, "width": 1470.0, "height": 956.0 },
-      "display_relative_frame": { "x": 0.0891156463, "y": 0.120292887, "width": 0.7619047619, "height": 0.7343096234 },
+      "display_frame": {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1470.0,
+        "height": 956.0
+      },
+      "display_relative_frame": {
+        "x": 0.0891156463,
+        "y": 0.120292887,
+        "width": 0.7619047619,
+        "height": 0.7343096234
+      },
       "z_order": 12,
       "fullscreen": false,
       "minimized": false
@@ -236,13 +451,176 @@
       "bundle_id": "com.apple.MobileSMS",
       "pid": 1012,
       "title": "Messages",
-      "frame": { "x": 0.0, "y": 33.0, "width": 1143.0, "height": 706.0 },
+      "frame": {
+        "x": 0.0,
+        "y": 33.0,
+        "width": 1143.0,
+        "height": 706.0
+      },
       "display_id": "cgdisplay-1",
-      "display_frame": { "x": 0.0, "y": 0.0, "width": 1470.0, "height": 956.0 },
-      "display_relative_frame": { "x": 0.0, "y": 0.0345188285, "width": 0.7775510204, "height": 0.7384937238 },
+      "display_frame": {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1470.0,
+        "height": 956.0
+      },
+      "display_relative_frame": {
+        "x": 0.0,
+        "y": 0.0345188285,
+        "width": 0.7775510204,
+        "height": 0.7384937238
+      },
       "z_order": 13,
       "fullscreen": false,
       "minimized": false
+    },
+    {
+      "window_id": 22,
+      "app_name": "Google Chrome Canary",
+      "process_name": "Google Chrome Canary",
+      "bundle_id": "com.google.Chrome.canary",
+      "pid": 1003,
+      "title": "Google Chrome Canary window",
+      "frame": {
+        "x": 0.0,
+        "y": 33.0,
+        "width": 1470.0,
+        "height": 833.0
+      },
+      "display_id": "cgdisplay-1",
+      "display_frame": {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1470.0,
+        "height": 956.0
+      },
+      "display_relative_frame": {
+        "x": 0.0,
+        "y": 0.0345188285,
+        "width": 1.0,
+        "height": 0.8713389121
+      },
+      "z_order": 14,
+      "fullscreen": false,
+      "minimized": false,
+      "browser_tabs": [
+        {
+          "title": "Rust",
+          "url": "https://www.rust-lang.org/",
+          "active": true
+        }
+      ]
+    },
+    {
+      "window_id": 23,
+      "app_name": "Brave Browser",
+      "process_name": "Brave Browser",
+      "bundle_id": "com.brave.Browser",
+      "pid": 1004,
+      "title": "Brave Browser window",
+      "frame": {
+        "x": 0.0,
+        "y": 33.0,
+        "width": 1470.0,
+        "height": 833.0
+      },
+      "display_id": "cgdisplay-1",
+      "display_frame": {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1470.0,
+        "height": 956.0
+      },
+      "display_relative_frame": {
+        "x": 0.0,
+        "y": 0.0345188285,
+        "width": 1.0,
+        "height": 0.8713389121
+      },
+      "z_order": 15,
+      "fullscreen": false,
+      "minimized": false,
+      "browser_tabs": [
+        {
+          "title": "Rust",
+          "url": "https://www.rust-lang.org/",
+          "active": true
+        }
+      ]
+    },
+    {
+      "window_id": 24,
+      "app_name": "Microsoft Edge",
+      "process_name": "Microsoft Edge",
+      "bundle_id": "com.microsoft.edgemac",
+      "pid": 1005,
+      "title": "Microsoft Edge window",
+      "frame": {
+        "x": 0.0,
+        "y": 33.0,
+        "width": 1470.0,
+        "height": 833.0
+      },
+      "display_id": "cgdisplay-1",
+      "display_frame": {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1470.0,
+        "height": 956.0
+      },
+      "display_relative_frame": {
+        "x": 0.0,
+        "y": 0.0345188285,
+        "width": 1.0,
+        "height": 0.8713389121
+      },
+      "z_order": 16,
+      "fullscreen": false,
+      "minimized": false,
+      "browser_tabs": [
+        {
+          "title": "Rust",
+          "url": "https://www.rust-lang.org/",
+          "active": true
+        }
+      ]
+    },
+    {
+      "window_id": 25,
+      "app_name": "Chromium",
+      "process_name": "Chromium",
+      "bundle_id": "org.chromium.Chromium",
+      "pid": 1006,
+      "title": "Chromium window",
+      "frame": {
+        "x": 0.0,
+        "y": 33.0,
+        "width": 1470.0,
+        "height": 833.0
+      },
+      "display_id": "cgdisplay-1",
+      "display_frame": {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1470.0,
+        "height": 956.0
+      },
+      "display_relative_frame": {
+        "x": 0.0,
+        "y": 0.0345188285,
+        "width": 1.0,
+        "height": 0.8713389121
+      },
+      "z_order": 17,
+      "fullscreen": false,
+      "minimized": false,
+      "browser_tabs": [
+        {
+          "title": "Rust",
+          "url": "https://www.rust-lang.org/",
+          "active": true
+        }
+      ]
     }
   ]
 }

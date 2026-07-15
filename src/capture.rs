@@ -46,6 +46,7 @@ pub fn capture_workspace(name: &str) -> Result<WorkspaceSnapshot> {
     }
 
     windows.sort_by_key(|window| window.z_order.unwrap_or(u32::MAX));
+    mark_fullscreen_windows(&mut windows);
     attach_chrome_tabs(&mut windows);
 
     Ok(WorkspaceSnapshot {
@@ -53,13 +54,33 @@ pub fn capture_workspace(name: &str) -> Result<WorkspaceSnapshot> {
         name: name.to_string(),
         created_at: Utc::now(),
         host: HostInfo {
-            hostname: std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string()),
+            hostname: hostname(),
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
         },
         displays,
         windows,
     })
+}
+
+/// The `HOSTNAME` env var is rarely set by interactive shells; ask libc.
+fn hostname() -> String {
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        let ok =
+            unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } == 0;
+        if ok {
+            if let Some(end) = buf.iter().position(|byte| *byte == 0) {
+                if let Ok(name) = std::str::from_utf8(&buf[..end]) {
+                    if !name.is_empty() {
+                        return name.to_string();
+                    }
+                }
+            }
+        }
+    }
+    std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())
 }
 
 fn dominant_display(frame: Frame, displays: &[DisplaySnapshot]) -> Option<&DisplaySnapshot> {
@@ -72,11 +93,71 @@ fn dominant_display(frame: Frame, displays: &[DisplaySnapshot]) -> Option<&Displ
     })
 }
 
-fn attach_chrome_tabs(windows: &mut [WindowSnapshot]) {
-    assign_chrome_tabs(windows, &chrome::capture_windows());
+/// The CG window list cannot see fullscreen status; enrich captured windows
+/// via AX so the planner's fullscreen skip-gate acts on real data. Best
+/// effort: without Accessibility permission this is a no-op.
+fn mark_fullscreen_windows(windows: &mut [WindowSnapshot]) {
+    use crate::macos::accessibility;
+
+    let pids: std::collections::HashSet<i32> = windows.iter().map(|window| window.pid).collect();
+    for pid in pids {
+        let Ok(states) = accessibility::ax_window_states(pid) else {
+            continue;
+        };
+        let fullscreen: Vec<_> = states
+            .into_iter()
+            .filter(|state| state.fullscreen)
+            .collect();
+        if fullscreen.is_empty() {
+            continue;
+        }
+        for window in windows.iter_mut().filter(|window| window.pid == pid) {
+            let matched = fullscreen.iter().any(|state| {
+                let title_match =
+                    state.title.is_some() && state.title.as_deref() == window.title.as_deref();
+                let frame_match = state
+                    .frame
+                    .map(|frame| frames_approx(frame, window.frame))
+                    .unwrap_or(false);
+                title_match || frame_match
+            });
+            if matched {
+                window.fullscreen = true;
+            }
+        }
+    }
 }
 
-fn assign_chrome_tabs(windows: &mut [WindowSnapshot], chrome_windows: &[chrome::ChromeWindowTabs]) {
+fn frames_approx(a: Frame, b: Frame) -> bool {
+    (a.x - b.x).abs() <= 2.0
+        && (a.y - b.y).abs() <= 2.0
+        && (a.width - b.width).abs() <= 2.0
+        && (a.height - b.height).abs() <= 2.0
+}
+
+fn attach_chrome_tabs(windows: &mut [WindowSnapshot]) {
+    for app in crate::app_support::tab_capable_apps() {
+        // Only shell out to osascript for browsers that actually have
+        // captured windows.
+        if !windows
+            .iter()
+            .any(|window| window.bundle_id.as_deref() == Some(app.bundle_id))
+        {
+            continue;
+        }
+        assign_browser_tabs(
+            windows,
+            app.bundle_id,
+            &chrome::capture_windows(app.bundle_id),
+        );
+    }
+}
+
+fn assign_browser_tabs(
+    windows: &mut [WindowSnapshot],
+    bundle_id: &str,
+    chrome_windows: &[chrome::ChromeWindowTabs],
+) {
     if chrome_windows.is_empty() {
         return;
     }
@@ -84,7 +165,7 @@ fn assign_chrome_tabs(windows: &mut [WindowSnapshot], chrome_windows: &[chrome::
     let snapshot_indices: Vec<usize> = windows
         .iter()
         .enumerate()
-        .filter(|(_, window)| window.bundle_id.as_deref() == Some("com.google.Chrome"))
+        .filter(|(_, window)| window.bundle_id.as_deref() == Some(bundle_id))
         .map(|(index, _)| index)
         .collect();
 
@@ -201,7 +282,7 @@ mod tests {
             },
         ];
 
-        assign_chrome_tabs(&mut windows, &chrome_windows);
+        assign_browser_tabs(&mut windows, "com.google.Chrome", &chrome_windows);
 
         assert_eq!(windows[0].browser_tabs[0].url, "https://example.com/docs");
         assert_eq!(windows[1].browser_tabs[0].url, "https://example.com/search");
@@ -224,7 +305,7 @@ mod tests {
             },
         ];
 
-        assign_chrome_tabs(&mut windows, &chrome_windows);
+        assign_browser_tabs(&mut windows, "com.google.Chrome", &chrome_windows);
 
         assert_eq!(windows[0].browser_tabs[0].url, "https://example.com/front");
         assert_eq!(windows[1].browser_tabs[0].url, "https://example.com/back");
@@ -241,7 +322,7 @@ mod tests {
             tabs: tabs("https://example.com/docs"),
         }];
 
-        assign_chrome_tabs(&mut windows, &chrome_windows);
+        assign_browser_tabs(&mut windows, "com.google.Chrome", &chrome_windows);
 
         // The titled match wins; the unrelated window gets nothing rather
         // than stealing the only tab set.

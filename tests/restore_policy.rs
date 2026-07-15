@@ -1,11 +1,14 @@
+//! Restore-policy behavior through the planner: which saved windows are
+//! planned for restore and which are skipped, and why.
+
 use chrono::{TimeZone, Utc};
 use workspace::{
     app_support::KNOWN_APPS,
     model::{
-        DisplaySnapshot, Frame, HostInfo, RelativeFrame, RestoreStatus, WindowSnapshot,
-        WorkspaceSnapshot, SNAPSHOT_VERSION,
+        DisplaySnapshot, Frame, HostInfo, RelativeFrame, WindowSnapshot, WorkspaceSnapshot,
+        SNAPSHOT_VERSION,
     },
-    restore::{restore_workspace, RestoreOptions},
+    plan::{plan_restore, OperationKind, PlanOptions, WorldState},
 };
 
 fn display() -> DisplaySnapshot {
@@ -69,72 +72,84 @@ fn snapshot(windows: Vec<WindowSnapshot>) -> WorkspaceSnapshot {
     }
 }
 
-#[test]
-fn dry_run_plans_supported_windows_and_skips_unknown_windows() {
-    let report = restore_workspace(
-        &snapshot(vec![
-            window(Some("com.microsoft.VSCode"), "Code", 0),
-            window(Some("com.google.Chrome"), "Google Chrome", 1),
-            window(Some("com.apple.Terminal"), "Terminal", 2),
-            window(None, "Unknown", 3),
-        ]),
-        RestoreOptions {
-            mode: Default::default(),
-            dry_run: true,
-            dev_mode: false,
-        },
+fn plan_for(snap: &WorkspaceSnapshot) -> workspace::plan::RestorePlan {
+    let frames: Vec<Frame> = snap.windows.iter().map(|w| w.frame).collect();
+    plan_restore(
+        snap,
+        &WorldState::default(),
+        PlanOptions::default(),
+        &frames,
     )
-    .unwrap();
+}
 
-    assert_eq!(report.restored, 0);
-    assert_eq!(report.skipped, 1);
-    assert_eq!(report.failed, 0);
-    assert_eq!(report.actions.len(), 4);
-    assert_eq!(report.actions[0].status, RestoreStatus::Planned);
-    assert_eq!(
-        report.actions[0].bundle_id.as_deref(),
-        Some("com.microsoft.VSCode")
-    );
-    assert_eq!(report.actions[1].status, RestoreStatus::Planned);
-    assert_eq!(report.actions[2].status, RestoreStatus::Planned);
-    assert_eq!(report.actions[3].status, RestoreStatus::Skipped);
-    assert!(report.actions[3]
-        .message
-        .as_deref()
-        .unwrap_or_default()
-        .contains("without bundle identifiers"));
+fn is_actionable(kind: &OperationKind) -> bool {
+    !matches!(kind, OperationKind::Skip { .. })
 }
 
 #[test]
-fn dry_run_plans_every_known_app() {
+fn plans_supported_windows_and_skips_unknown_windows() {
+    let snap = snapshot(vec![
+        window(Some("com.microsoft.VSCode"), "Code", 0),
+        window(Some("com.google.Chrome"), "Google Chrome", 1),
+        window(Some("com.apple.Terminal"), "Terminal", 2),
+        window(None, "Unknown", 3),
+    ]);
+
+    let plan = plan_for(&snap);
+
+    // Every supported window gets an actionable op; the unknown window is
+    // skipped with an explanatory reason.
+    for bundle in [
+        "com.microsoft.VSCode",
+        "com.google.Chrome",
+        "com.apple.Terminal",
+    ] {
+        assert!(
+            plan.operations
+                .iter()
+                .any(|op| op.bundle_id.as_deref() == Some(bundle) && is_actionable(&op.kind)),
+            "expected actionable op for {bundle}"
+        );
+    }
+    let skip = plan
+        .operations
+        .iter()
+        .find(|op| matches!(&op.kind, OperationKind::Skip { .. }) && op.bundle_id.is_none())
+        .expect("unknown window should be skipped");
+    assert!(skip.rationale.contains("without bundle identifiers"));
+}
+
+#[test]
+fn plans_every_known_app() {
     let windows = KNOWN_APPS
         .iter()
         .enumerate()
         .map(|(index, app)| window(Some(app.bundle_id), app.name, index as u32))
         .collect();
 
-    let report = restore_workspace(
-        &snapshot(windows),
-        RestoreOptions {
-            mode: Default::default(),
-            dry_run: true,
-            dev_mode: false,
-        },
-    )
-    .unwrap();
+    let plan = plan_for(&snapshot(windows));
 
-    assert_eq!(report.restored, 0);
-    assert_eq!(report.skipped, 0);
-    assert_eq!(report.failed, 0);
-    assert_eq!(report.actions.len(), KNOWN_APPS.len());
-    for (action, app) in report.actions.iter().zip(KNOWN_APPS) {
-        assert_eq!(action.status, RestoreStatus::Planned, "{}", app.bundle_id);
-        assert_eq!(action.bundle_id.as_deref(), Some(app.bundle_id));
+    for app in KNOWN_APPS {
+        assert!(
+            plan.operations
+                .iter()
+                .any(|op| op.bundle_id.as_deref() == Some(app.bundle_id)
+                    && is_actionable(&op.kind)),
+            "{} should be planned for restore",
+            app.bundle_id
+        );
     }
+    assert!(
+        !plan
+            .operations
+            .iter()
+            .any(|op| matches!(op.kind, OperationKind::Skip { .. })),
+        "no known app should be skipped"
+    );
 }
 
 #[test]
-fn dry_run_plans_multiple_windows_for_every_known_app() {
+fn plans_multiple_windows_for_every_known_app() {
     let windows = KNOWN_APPS
         .iter()
         .enumerate()
@@ -145,26 +160,18 @@ fn dry_run_plans_multiple_windows_for_every_known_app() {
             ]
         })
         .collect::<Vec<_>>();
-    let expected_count = windows.len();
+    let window_count = windows.len();
 
-    let report = restore_workspace(
-        &snapshot(windows),
-        RestoreOptions {
-            mode: Default::default(),
-            dry_run: true,
-            dev_mode: false,
-        },
-    )
-    .unwrap();
+    let plan = plan_for(&snapshot(windows));
 
-    assert_eq!(report.restored, 0);
-    assert_eq!(report.skipped, 0);
-    assert_eq!(report.failed, 0);
-    assert_eq!(report.actions.len(), expected_count);
-    assert!(report
-        .actions
+    // Every saved window is covered by an op carrying its index.
+    let covered: std::collections::HashSet<usize> = plan
+        .operations
         .iter()
-        .all(|action| action.status == RestoreStatus::Planned));
+        .filter(|op| is_actionable(&op.kind))
+        .filter_map(|op| op.saved_window_index)
+        .collect();
+    assert_eq!(covered.len(), window_count);
 }
 
 #[test]
@@ -172,22 +179,13 @@ fn fullscreen_supported_windows_are_still_skipped() {
     let mut vscode = window(Some("com.microsoft.VSCode"), "Code", 0);
     vscode.fullscreen = true;
 
-    let report = restore_workspace(
-        &snapshot(vec![vscode]),
-        RestoreOptions {
-            mode: Default::default(),
-            dry_run: true,
-            dev_mode: false,
-        },
-    )
-    .unwrap();
+    let plan = plan_for(&snapshot(vec![vscode]));
 
-    assert_eq!(report.actions[0].status, RestoreStatus::Skipped);
-    assert!(report.actions[0]
-        .message
-        .as_deref()
-        .unwrap_or_default()
-        .contains("fullscreen"));
+    assert!(matches!(
+        plan.operations[0].kind,
+        OperationKind::Skip { .. }
+    ));
+    assert!(plan.operations[0].rationale.contains("fullscreen"));
 }
 
 #[test]
@@ -195,20 +193,11 @@ fn disabled_windows_are_skipped_before_restore() {
     let mut vscode = window(Some("com.microsoft.VSCode"), "Code", 0);
     vscode.enabled = false;
 
-    let report = restore_workspace(
-        &snapshot(vec![vscode]),
-        RestoreOptions {
-            mode: Default::default(),
-            dry_run: true,
-            dev_mode: false,
-        },
-    )
-    .unwrap();
+    let plan = plan_for(&snapshot(vec![vscode]));
 
-    assert_eq!(report.actions[0].status, RestoreStatus::Skipped);
-    assert!(report.actions[0]
-        .message
-        .as_deref()
-        .unwrap_or_default()
-        .contains("disabled"));
+    assert!(matches!(
+        plan.operations[0].kind,
+        OperationKind::Skip { .. }
+    ));
+    assert!(plan.operations[0].rationale.contains("disabled"));
 }

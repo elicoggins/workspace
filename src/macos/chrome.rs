@@ -18,11 +18,12 @@ mod imp {
     use super::*;
 
     const CAPTURE_SCRIPT: &str = r#"
-const chrome = Application('Google Chrome');
-if (!chrome.running()) {
-  JSON.stringify([]);
-} else {
-  JSON.stringify(chrome.windows().map((window) => {
+function run(argv) {
+  const chrome = Application(argv[0]);
+  if (!chrome.running()) {
+    return JSON.stringify([]);
+  }
+  return JSON.stringify(chrome.windows().map((window) => {
     const activeTabIndex = window.activeTabIndex();
     return {
       title: window.name(),
@@ -51,12 +52,13 @@ if (!chrome.running()) {
         active: bool,
     }
 
-    pub fn capture_windows() -> Vec<ChromeWindowTabs> {
+    pub fn capture_windows(bundle_id: &str) -> Vec<ChromeWindowTabs> {
         let output = Command::new("/usr/bin/osascript")
             .arg("-l")
             .arg("JavaScript")
             .arg("-e")
             .arg(CAPTURE_SCRIPT)
+            .arg(bundle_id)
             .output();
 
         let Ok(output) = output else {
@@ -76,8 +78,8 @@ if (!chrome.running()) {
     /// planner matched live are handled by `Reposition` ops and stay intact.
     const RESTORE_SCRIPT: &str = r#"
 function run(argv) {
-  const specs = JSON.parse(argv[0]);
-  const chrome = Application('Google Chrome');
+  const chrome = Application(argv[0]);
+  const specs = JSON.parse(argv[1]);
   chrome.activate();
   const used = [];
   const errors = [];
@@ -85,7 +87,7 @@ function run(argv) {
     try {
       if (w.tabs().length !== 1) return false;
       const url = w.activeTab.url() || '';
-      return url === '' || url.indexOf('chrome://newtab') === 0;
+      return url === '' || url === 'about:blank' || /^[a-z-]+:\/\/newtab/.test(url);
     } catch (e) {
       return false;
     }
@@ -157,9 +159,9 @@ function run(argv) {
     /// bounds — the executor has just AX-moved it to `target`.
     const RECONCILE_SCRIPT: &str = r#"
 function run(argv) {
-  const spec = JSON.parse(argv[0]);
-  const chrome = Application('Google Chrome');
-  if (!chrome.running()) return 'error: chrome not running';
+  const chrome = Application(argv[0]);
+  const spec = JSON.parse(argv[1]);
+  if (!chrome.running()) return 'error: browser not running';
   const wins = chrome.windows();
   let best = null, bestDist = Infinity;
   for (let i = 0; i < wins.length; i++) {
@@ -178,7 +180,7 @@ function run(argv) {
   // because the saved one was closed). Grafting saved tabs onto it would
   // pollute an unrelated window — skip instead.
   const isBlankWindow = existing.length === 1 &&
-    (existing[0] === '' || existing[0].indexOf('chrome://newtab') === 0);
+    (existing[0] === '' || existing[0] === 'about:blank' || /^[a-z-]+:\/\/newtab/.test(existing[0]));
   const overlap = existing.filter(function (u) { return spec.urls.indexOf(u) !== -1; }).length;
   if (!isBlankWindow && overlap === 0) return 'error: matched window shares no saved tabs; not reconciling';
   let added = 0;
@@ -198,9 +200,82 @@ function run(argv) {
 }
 "#;
 
+    /// Move a browser window by scripting `bounds`. Chromium's AX
+    /// implementation intermittently rejects `AXSize` writes
+    /// (kAXErrorFailure -25200); the scripting dictionary is deterministic.
+    /// The window is located by its current frame.
+    const SET_BOUNDS_SCRIPT: &str = r#"
+function run(argv) {
+  const chrome = Application(argv[0]);
+  const spec = JSON.parse(argv[1]);
+  if (!chrome.running()) return 'error: browser not running';
+  const wins = chrome.windows();
+  let best = null, bestDist = Infinity;
+  for (let i = 0; i < wins.length; i++) {
+    let b;
+    try { b = wins[i].bounds(); } catch (e) { continue; }
+    const d = Math.abs(b.x - spec.fx) + Math.abs(b.y - spec.fy) +
+              Math.abs(b.width - spec.fw) + Math.abs(b.height - spec.fh);
+    if (d < bestDist) { bestDist = d; best = wins[i]; }
+  }
+  if (!best || bestDist > 60) return 'error: no window near source bounds (dist ' + bestDist + ')';
+  best.bounds = { x: spec.tx, y: spec.ty, width: spec.tw, height: spec.th };
+  return 'ok';
+}
+"#;
+
+    /// Returns `Ok(true)` when a window near `from` was moved to `to`.
+    pub fn set_window_bounds(bundle_id: &str, from: Frame, to: Frame) -> Result<bool> {
+        let spec = serde_json::json!({
+            "fx": from.x.round() as i64,
+            "fy": from.y.round() as i64,
+            "fw": from.width.round() as i64,
+            "fh": from.height.round() as i64,
+            "tx": to.x.round() as i64,
+            "ty": to.y.round() as i64,
+            "tw": to.width.round() as i64,
+            "th": to.height.round() as i64,
+        })
+        .to_string();
+        let output = Command::new("/usr/bin/osascript")
+            .arg("-l")
+            .arg("JavaScript")
+            .arg("-e")
+            .arg(SET_BOUNDS_SCRIPT)
+            .arg(bundle_id)
+            .arg(&spec)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|source| {
+                WorkspaceError::MacOs(format!("failed to run browser bounds script: {source}"))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WorkspaceError::MacOs(format!(
+                "browser bounds script exited with {}: {}",
+                output.status,
+                stderr.trim()
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = stdout.trim();
+        if stdout == "ok" {
+            Ok(true)
+        } else {
+            tracing::debug!(%stdout, "browser bounds script could not move window");
+            Ok(false)
+        }
+    }
+
     /// Returns `Ok(Some(n))` with the number of re-opened tabs, or `Ok(None)`
     /// when the target window could not be located.
-    pub fn reconcile_window_tabs(saved: &WindowSnapshot, target: Frame) -> Result<Option<usize>> {
+    pub fn reconcile_window_tabs(
+        bundle_id: &str,
+        saved: &WindowSnapshot,
+        target: Frame,
+    ) -> Result<Option<usize>> {
         if saved.browser_tabs.is_empty() {
             return Ok(Some(0));
         }
@@ -219,6 +294,7 @@ function run(argv) {
             .arg("JavaScript")
             .arg("-e")
             .arg(RECONCILE_SCRIPT)
+            .arg(bundle_id)
             .arg(&spec)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -246,7 +322,7 @@ function run(argv) {
         }
     }
 
-    pub fn restore_windows(windows: &[(&WindowSnapshot, Frame)]) -> Result<bool> {
+    pub fn restore_windows(bundle_id: &str, windows: &[(&WindowSnapshot, Frame)]) -> Result<bool> {
         if windows.is_empty() {
             return Ok(true);
         }
@@ -257,6 +333,7 @@ function run(argv) {
             .arg("JavaScript")
             .arg("-e")
             .arg(RESTORE_SCRIPT)
+            .arg(bundle_id)
             .arg(&spec)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -345,23 +422,31 @@ function run(argv) {
 mod imp {
     use super::*;
 
-    pub fn capture_windows() -> Vec<ChromeWindowTabs> {
+    pub fn capture_windows(_bundle_id: &str) -> Vec<ChromeWindowTabs> {
         Vec::new()
     }
 
-    pub fn restore_windows(_windows: &[(&WindowSnapshot, Frame)]) -> Result<bool> {
+    pub fn restore_windows(
+        _bundle_id: &str,
+        _windows: &[(&WindowSnapshot, Frame)],
+    ) -> Result<bool> {
         Err(WorkspaceError::UnsupportedPlatform)
     }
 
     pub fn reconcile_window_tabs(
+        _bundle_id: &str,
         _saved: &WindowSnapshot,
         _target: Frame,
     ) -> Result<Option<usize>> {
         Err(WorkspaceError::UnsupportedPlatform)
     }
+
+    pub fn set_window_bounds(_bundle_id: &str, _from: Frame, _to: Frame) -> Result<bool> {
+        Err(WorkspaceError::UnsupportedPlatform)
+    }
 }
 
-pub use imp::{capture_windows, reconcile_window_tabs, restore_windows};
+pub use imp::{capture_windows, reconcile_window_tabs, restore_windows, set_window_bounds};
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {

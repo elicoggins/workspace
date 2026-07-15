@@ -23,7 +23,9 @@ dialoguer = "0.11"
 libc = "0.2"
 objc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# float_roundtrip: parse(print(f64)) must be exact, or every snapshot
+# load perturbs geometry by 1 ULP and equality checks fail.
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

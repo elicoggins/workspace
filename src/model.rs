@@ -91,37 +91,6 @@ pub struct SnapshotListEntry {
     pub window_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RestoreReport {
-    pub snapshot: String,
-    pub dry_run: bool,
-    pub restored: usize,
-    pub skipped: usize,
-    pub failed: usize,
-    pub actions: Vec<RestoreAction>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RestoreAction {
-    pub bundle_id: Option<String>,
-    pub app_name: String,
-    pub title: Option<String>,
-    pub saved_frame: Frame,
-    pub target_frame: Frame,
-    pub display_id: Option<String>,
-    pub status: RestoreStatus,
-    pub message: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RestoreStatus {
-    Planned,
-    Restored,
-    Skipped,
-    Failed,
-}
-
 impl Frame {
     pub fn right(self) -> f64 {
         self.x + self.width

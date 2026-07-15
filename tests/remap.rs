@@ -1,6 +1,6 @@
 use workspace::{
     model::{DisplaySnapshot, Frame, RelativeFrame, WindowSnapshot},
-    restore::target_frame_for_window,
+    world::target_frame_for_window,
 };
 
 fn display(id: &str, numeric_id: u32, frame: Frame, primary: bool) -> DisplaySnapshot {

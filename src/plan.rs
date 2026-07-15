@@ -3,7 +3,7 @@
 //! The planner takes a saved [`WorkspaceSnapshot`] plus an observed
 //! [`WorldState`] (current displays + live windows + running apps) and produces a
 //! deterministic [`RestorePlan`].  Execution is intentionally pushed elsewhere
-//! (`restore.rs`) so the planner can be exercised exhaustively from unit tests
+//! (`execute.rs`) so the planner can be exercised exhaustively from unit tests
 //! without ever touching real macOS APIs.
 //!
 //! The planner is the trust boundary of the application:
@@ -91,11 +91,26 @@ pub struct MatchScore {
     pub title_similarity: f32,
     pub geometry_similarity: f32,
     pub bundle_match: bool,
+    /// Both windows actually had titles to compare. Without Screen Recording
+    /// permission every live title is `None`, and a title-blind score is far
+    /// weaker evidence of identity than the same number with titles.
+    #[serde(default)]
+    pub title_evidence: bool,
     pub final_score: f32,
 }
 
 impl MatchScore {
     pub const MIN_ACCEPT: f32 = 0.20;
+    /// Without title evidence, only near-exact geometry counts as identity —
+    /// a permissive floor lets a saved window hijack whatever window of the
+    /// same app happens to be open (observed live: a snapshot whose Chrome
+    /// window was closed matched and relocated an unrelated Chrome window).
+    pub const GEOMETRY_ONLY_MIN: f32 = 0.85;
+
+    pub fn is_acceptable(&self) -> bool {
+        self.final_score >= Self::MIN_ACCEPT
+            && (self.title_evidence || self.geometry_similarity >= Self::GEOMETRY_ONLY_MIN)
+    }
 
     pub fn explain(&self) -> String {
         format!(
@@ -410,7 +425,7 @@ fn plan_group(
 
     let assignments = assign_matches(&saved, &live_candidates, consumed_live);
 
-    let is_chrome = bundle_id == "com.google.Chrome";
+    let tab_capable = crate::app_support::is_tab_capable(Some(bundle_id.as_str()));
 
     for ((local_index, &saved_index), assignment) in
         active_indices.iter().enumerate().zip(assignments)
@@ -437,7 +452,7 @@ fn plan_group(
                 ),
                 match_score: Some(score),
             });
-        } else if is_chrome && !window.browser_tabs.is_empty() {
+        } else if tab_capable && !window.browser_tabs.is_empty() {
             operations.push(PlannedOperation {
                 kind: OperationKind::RestoreChromeTabs {
                     bundle_id: bundle_id.clone(),
@@ -447,7 +462,7 @@ fn plan_group(
                 app_name: window.app_name.clone(),
                 bundle_id: Some(bundle_id.clone()),
                 rationale: format!(
-                    "creating Chrome window with {} captured tabs",
+                    "creating browser window with {} captured tabs",
                     window.browser_tabs.len()
                 ),
                 match_score: None,
@@ -580,8 +595,10 @@ fn count_unconsumed_conflicts(
 
 /// Greedy stable matcher: best (saved, live) pair first, distinct assignment.
 /// Returns `None` for any saved window where no live candidate clears the
-/// minimum acceptance threshold.
-fn assign_matches(
+/// acceptance gate ([`MatchScore::is_acceptable`]).
+///
+/// Shared by the planner and `verify` so both report the same matches.
+pub(crate) fn assign_matches(
     saved: &[&WindowSnapshot],
     live: &[&LiveWindow],
     already_consumed: &HashSet<u32>,
@@ -610,7 +627,7 @@ fn assign_matches(
         if assignments[saved_idx].is_some() || used_live.contains(&live_idx) {
             continue;
         }
-        if score.final_score < MatchScore::MIN_ACCEPT {
+        if !score.is_acceptable() {
             continue;
         }
         assignments[saved_idx] = Some((live_idx, score));
@@ -627,6 +644,7 @@ pub fn compute_match_score(saved: &WindowSnapshot, candidate: &LiveWindow) -> Ma
         .map(|(left, right)| left == right)
         .unwrap_or(false);
 
+    let title_evidence = saved.title.is_some() && candidate.title.is_some();
     let title_similarity = title_similarity(saved.title.as_deref(), candidate.title.as_deref());
     let geometry_similarity = geometry_similarity(saved.frame, candidate.frame);
 
@@ -639,6 +657,7 @@ pub fn compute_match_score(saved: &WindowSnapshot, candidate: &LiveWindow) -> Ma
         title_similarity,
         geometry_similarity,
         bundle_match,
+        title_evidence,
         final_score,
     }
 }
@@ -711,14 +730,13 @@ fn geometry_similarity(left: Frame, right: Frame) -> f32 {
 }
 
 /// Project an `app_support`-supported saved window onto a current display.
-/// Pure helper used by both the planner and `restore.rs` so they share a
-/// single source of truth.
+/// Thin re-export of the shared remap logic in `world.rs`.
 pub fn target_frame_for_window(
     window: &WindowSnapshot,
     saved_displays: &[DisplaySnapshot],
     current_displays: &[DisplaySnapshot],
 ) -> Frame {
-    crate::restore::target_frame_for_window(window, saved_displays, current_displays)
+    crate::world::target_frame_for_window(window, saved_displays, current_displays)
 }
 
 #[cfg(test)]
@@ -1139,6 +1157,95 @@ mod tests {
         let score = compute_match_score(&saved_window, &live_window);
         assert!(score.bundle_match);
         assert!(score.final_score < 0.6, "score was {}", score.final_score);
+    }
+
+    #[test]
+    fn titleless_windows_do_not_match_on_weak_geometry() {
+        // Regression: without Screen Recording permission all titles are None,
+        // and a saved window whose real window was closed used to "match" a
+        // completely different window of the same app and relocate it.
+        let bundle = "com.google.Chrome";
+        let mut saved_window = saved(
+            "ignored",
+            Frame {
+                x: 200.0,
+                y: 120.0,
+                width: 900.0,
+                height: 600.0,
+            },
+            bundle,
+        );
+        saved_window.title = None;
+        let mut live_window = live(
+            "ignored",
+            Frame {
+                x: 0.0,
+                y: 33.0,
+                width: 1470.0,
+                height: 833.0,
+            },
+            bundle,
+            9,
+        );
+        live_window.title = None;
+        let snapshot = snap(vec![saved_window]);
+        let world = world(vec![live_window], &[bundle]);
+        let frames = frames_for(&snapshot);
+
+        let plan = plan_restore(&snapshot, &world, PlanOptions::default(), &frames);
+
+        assert!(
+            !plan
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OperationKind::Reposition { .. })),
+            "titleless weak-geometry match must be rejected: {plan:?}"
+        );
+        assert!(plan
+            .operations
+            .iter()
+            .any(|op| matches!(op.kind, OperationKind::CreateWindow { .. })));
+    }
+
+    #[test]
+    fn titleless_windows_match_on_near_exact_geometry() {
+        let bundle = "com.google.Chrome";
+        let mut saved_window = saved(
+            "ignored",
+            Frame {
+                x: 200.0,
+                y: 120.0,
+                width: 900.0,
+                height: 600.0,
+            },
+            bundle,
+        );
+        saved_window.title = None;
+        // Same window drifted by a few pixels (e.g. Chrome resized itself).
+        let mut live_window = live(
+            "ignored",
+            Frame {
+                x: 204.0,
+                y: 124.0,
+                width: 900.0,
+                height: 600.0,
+            },
+            bundle,
+            9,
+        );
+        live_window.title = None;
+        let snapshot = snap(vec![saved_window]);
+        let world = world(vec![live_window], &[bundle]);
+        let frames = frames_for(&snapshot);
+
+        let plan = plan_restore(&snapshot, &world, PlanOptions::default(), &frames);
+
+        assert!(
+            plan.operations
+                .iter()
+                .any(|op| matches!(op.kind, OperationKind::Reposition { .. })),
+            "near-exact geometry should still match without titles: {plan:?}"
+        );
     }
 
     #[test]

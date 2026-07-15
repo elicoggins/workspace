@@ -542,11 +542,11 @@ impl Executor for SimulatedExecutor {
 #[cfg(target_os = "macos")]
 pub struct MacOsExecutor {
     world: WorldState,
-    /// Bundles this run launched whose initial window has not yet been
-    /// claimed by a CreateWindow op. Launching an app almost always opens a
-    /// window on its own; the first CreateWindow for that bundle adopts it
-    /// instead of stacking an extra window on top.
-    launched_pending_window: std::collections::HashSet<String>,
+    /// Windows that appeared when this run launched an app and have not yet
+    /// been claimed by a CreateWindow op. Launching an app usually opens one
+    /// or more windows on its own (VS Code restores whole workspaces);
+    /// CreateWindow ops adopt these instead of stacking extra windows on top.
+    adoptable_windows: std::collections::HashMap<String, Vec<u32>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -563,8 +563,20 @@ impl MacOsExecutor {
     pub fn new(world: WorldState) -> Self {
         Self {
             world,
-            launched_pending_window: std::collections::HashSet::new(),
+            adoptable_windows: std::collections::HashMap::new(),
         }
+    }
+
+    /// System Events names processes by their displayed app name ("Code",
+    /// "Google Chrome"), not the executable name captured in snapshots
+    /// ("Electron"). Resolve it from the running app; fall back to the saved
+    /// process name.
+    fn system_events_process_name(bundle_id: &str, fallback: &str) -> String {
+        crate::macos::app::running_pids_for_bundle(bundle_id)
+            .first()
+            .and_then(|pid| crate::macos::app::application_for_pid(*pid))
+            .and_then(|info| info.localized_name)
+            .unwrap_or_else(|| fallback.to_string())
     }
 
     fn find_live(&self, pid: i32, window_id: u32) -> Option<&LiveWindow> {
@@ -682,10 +694,15 @@ impl Executor for MacOsExecutor {
             .with_attempts(attempts));
         }
 
-        // Best-effort: also wait for its first window, then let the first
-        // CreateWindow op for this bundle adopt it.
+        // Best-effort: wait for its first window, then record every window
+        // the launch produced so CreateWindow ops can adopt them.
         let has_window = Self::wait_for_any_window(bundle_id).is_some();
-        self.launched_pending_window.insert(bundle_id.to_string());
+        let adoptable: Vec<u32> = Self::cg_windows_for_bundle(bundle_id)
+            .iter()
+            .map(|raw| raw.window_id)
+            .collect();
+        self.adoptable_windows
+            .insert(bundle_id.to_string(), adoptable);
         if has_window {
             Ok(OpOutcome::success(format!("launched {bundle_id}")).with_attempts(attempts))
         } else {
@@ -702,18 +719,22 @@ impl Executor for MacOsExecutor {
         saved: &WindowSnapshot,
         target: Frame,
     ) -> Result<OpOutcome> {
-        // Adopt the window the app opened at launch instead of opening
-        // another one on top of it.
-        if self.launched_pending_window.remove(bundle_id) {
-            if let Some(raw) = Self::wait_for_any_window(bundle_id) {
-                return Ok(Self::position_raw_window(
-                    bundle_id,
-                    &raw,
-                    target,
-                    "adopted launch window",
-                ));
+        // Adopt a window the app opened at launch instead of opening another
+        // one on top of it; only Cmd+N once the launch pool is exhausted.
+        if let Some(pool) = self.adoptable_windows.get_mut(bundle_id) {
+            while let Some(window_id) = pool.pop() {
+                if let Some(raw) = Self::cg_windows_for_bundle(bundle_id)
+                    .into_iter()
+                    .find(|raw| raw.window_id == window_id)
+                {
+                    return Ok(Self::position_raw_window(
+                        bundle_id,
+                        &raw,
+                        target,
+                        "adopted launch window",
+                    ));
+                }
             }
-            // No window ever appeared; fall through and explicitly create one.
         }
 
         let before: std::collections::HashSet<u32> = Self::cg_windows_for_bundle(bundle_id)
@@ -721,7 +742,8 @@ impl Executor for MacOsExecutor {
             .map(|raw| raw.window_id)
             .collect();
 
-        match crate::macos::app::create_new_window(bundle_id, &saved.process_name) {
+        let process_name = Self::system_events_process_name(bundle_id, &saved.process_name);
+        match crate::macos::app::create_new_window(bundle_id, &process_name) {
             Ok(true) => {}
             Ok(false) => {
                 return Ok(OpOutcome::failed(format!(
@@ -754,8 +776,7 @@ impl Executor for MacOsExecutor {
                     .with_attempts(attempts),
             ),
             None => Ok(OpOutcome::partial(format!(
-                "asked {} (process {}) for a new window but none appeared",
-                bundle_id, saved.process_name
+                "asked {bundle_id} (process {process_name}) for a new window but none appeared"
             ))
             .with_attempts(attempts)),
         }
@@ -764,20 +785,47 @@ impl Executor for MacOsExecutor {
     fn reposition(
         &mut self,
         pid: i32,
-        _window_id: u32,
+        window_id: u32,
         saved: &WindowSnapshot,
         target: Frame,
     ) -> Result<OpOutcome> {
-        match crate::macos::accessibility::set_window_frame(pid, saved, target) {
+        // A minimized window can be AX-matched and "moved", but stays in the
+        // Dock. Un-minimize it first so the reposition is actually visible.
+        let live_frame = self.find_live(pid, window_id).map(|live| {
+            if live.minimized {
+                let synthetic = Self::synthetic_snapshot(live);
+                let _ = crate::macos::accessibility::unminimize_window(pid, &synthetic);
+            }
+            live.frame
+        });
+
+        let tab_capable = crate::app_support::is_tab_capable(saved.bundle_id.as_deref());
+        let bundle_id = saved.bundle_id.as_deref().unwrap_or_default();
+
+        // Chromium's AX implementation intermittently rejects AXSize writes
+        // (kAXErrorFailure -25200); scripting `bounds` is deterministic, so
+        // prefer it for tab-capable browsers and fall back to AX.
+        let positioned = if tab_capable {
+            let from = live_frame.unwrap_or(saved.frame);
+            match crate::macos::chrome::set_window_bounds(bundle_id, from, target) {
+                Ok(true) => Ok(true),
+                Ok(false) | Err(_) => {
+                    crate::macos::accessibility::set_window_frame(pid, saved, target)
+                }
+            }
+        } else {
+            crate::macos::accessibility::set_window_frame(pid, saved, target)
+        };
+
+        match positioned {
             Ok(true) => {
-                // A matched Chrome window keeps its identity, but the user may
-                // have closed some of its saved tabs — re-open the missing
+                // A matched browser window keeps its identity, but the user
+                // may have closed some of its saved tabs — re-open the missing
                 // ones (add-only; nothing the user has open is touched).
-                if saved.bundle_id.as_deref() == Some("com.google.Chrome")
-                    && !saved.browser_tabs.is_empty()
-                {
+                if tab_capable && !saved.browser_tabs.is_empty() {
                     return Ok(
-                        match crate::macos::chrome::reconcile_window_tabs(saved, target) {
+                        match crate::macos::chrome::reconcile_window_tabs(bundle_id, saved, target)
+                        {
                             Ok(Some(0)) => OpOutcome::success("repositioned".to_string()),
                             Ok(Some(n)) => OpOutcome::success(format!(
                                 "repositioned; reopened {n} missing tab(s)"
@@ -801,12 +849,12 @@ impl Executor for MacOsExecutor {
 
     fn restore_chrome_tabs(
         &mut self,
-        _bundle_id: &str,
+        bundle_id: &str,
         windows: &[(&WindowSnapshot, Frame)],
     ) -> Result<OpOutcome> {
-        match crate::macos::chrome::restore_windows(windows) {
+        match crate::macos::chrome::restore_windows(bundle_id, windows) {
             Ok(true) => Ok(OpOutcome::success(format!(
-                "restored {} chrome window(s)",
+                "restored {} browser window(s)",
                 windows.len()
             ))),
             Ok(false) => Ok(OpOutcome::partial(

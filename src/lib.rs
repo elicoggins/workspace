@@ -9,10 +9,11 @@ pub mod macos;
 pub mod model;
 pub mod output;
 pub mod plan;
-pub mod restore;
+pub mod selftest;
 pub mod storage;
 pub mod style;
 pub mod verify;
+pub mod world;
 
 use cli::{Cli, Command, ModeArg};
 use error::Result;
@@ -47,29 +48,6 @@ pub fn run(cli: Cli) -> Result<()> {
                 println!("  path      {}", style::dim(&path.display().to_string()));
             }
         }
-        Command::Restore {
-            name,
-            dry_run,
-            dev_mode,
-            mode,
-            destructive,
-        } => {
-            let snapshot = store.load(&name)?;
-            let resolved_mode = resolve_mode(mode, destructive);
-            let report = restore::restore_workspace(
-                &snapshot,
-                restore::RestoreOptions {
-                    dry_run,
-                    dev_mode,
-                    mode: resolved_mode,
-                },
-            )?;
-            if cli.json {
-                output::print_json(&report)?;
-            } else {
-                output::print_restore_report(&report);
-            }
-        }
         Command::Plan {
             name,
             dev_mode,
@@ -78,7 +56,7 @@ pub fn run(cli: Cli) -> Result<()> {
         } => {
             let snapshot = store.load(&name)?;
             let resolved_mode = resolve_mode(mode, destructive);
-            let plan = restore::build_plan(&snapshot, resolved_mode, dev_mode)?;
+            let plan = world::build_plan(&snapshot, resolved_mode, dev_mode)?;
             if cli.json {
                 output::print_json(&plan)?;
             } else {
@@ -87,7 +65,7 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         Command::Verify { name } => {
             let snapshot = store.load(&name)?;
-            let report = restore::verify_workspace(&snapshot)?;
+            let report = world::verify_workspace(&snapshot)?;
             if cli.json {
                 output::print_json(&report)?;
             } else {
@@ -95,11 +73,26 @@ pub fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Doctor => {
-            let report = restore::doctor()?;
+            let report = world::doctor()?;
             if cli.json {
                 output::print_json(&report)?;
             } else {
                 output::print_doctor_report(&report);
+            }
+        }
+        Command::Selftest { live } => {
+            let report = selftest::run(live)?;
+            if cli.json {
+                output::print_json(&report)?;
+            } else {
+                output::print_selftest_report(&report);
+            }
+            let failed = report.failed();
+            if failed > 0 {
+                return Err(error::WorkspaceError::SelftestFailed {
+                    failed,
+                    total: report.checks.len(),
+                });
             }
         }
         Command::List => {
@@ -163,7 +156,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Apply {
+        Command::Restore {
             name,
             dry_run,
             dev_mode,
@@ -171,7 +164,7 @@ pub fn run(cli: Cli) -> Result<()> {
             destructive,
             converge,
         } => {
-            run_apply(
+            run_restore(
                 &store,
                 &name,
                 dry_run,
@@ -190,8 +183,8 @@ pub fn run(cli: Cli) -> Result<()> {
         } => {
             let snapshot = store.load(&name)?;
             let resolved_mode = resolve_mode(mode, destructive);
-            let plan = restore::build_plan(&snapshot, resolved_mode, dev_mode)?;
-            let verify = restore::verify_workspace(&snapshot)?;
+            let plan = world::build_plan(&snapshot, resolved_mode, dev_mode)?;
+            let verify = world::verify_workspace(&snapshot)?;
             if cli.json {
                 output::print_json(&serde_json::json!({
                     "plan": plan,
@@ -215,7 +208,7 @@ pub fn run(cli: Cli) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_apply(
+fn run_restore(
     store: &SnapshotStore,
     name: &str,
     dry_run: bool,
@@ -229,8 +222,7 @@ fn run_apply(
     let resolved_mode = resolve_mode(mode, destructive);
 
     // Fail fast with a clear error instead of a journal full of cryptic AX
-    // failures when the permission is missing. (Legacy `restore` already
-    // does this; `apply` must too.)
+    // failures when the permission is missing.
     #[cfg(target_os = "macos")]
     if !dry_run {
         macos::accessibility::ensure_trusted()?;
@@ -241,43 +233,53 @@ fn run_apply(
     let mut final_verify = None;
 
     for iter in 0..max_iters {
-        let plan = restore::build_plan(&snapshot, resolved_mode, dev_mode)?;
+        let plan = world::build_plan(&snapshot, resolved_mode, dev_mode)?;
+        let actionable = plan
+            .operations
+            .iter()
+            .any(|op| !matches!(op.kind, plan::OperationKind::Skip { .. }));
         let options = execute::ExecuteOptions { dry_run };
 
         let journal = if dry_run {
             // Dry-run: use the planner output but never touch macOS. Drive a
             // SimulatedExecutor seeded with the observed world so the journal
             // shows the would-be ops without mutating state.
-            let world = restore::observe_world()?;
+            let world = world::observe_world()?;
             let mut sim = execute::SimulatedExecutor::new(world);
             execute::execute_plan(&snapshot, &plan, &mut sim, options)
         } else {
             #[cfg(target_os = "macos")]
             {
-                let world = restore::observe_world()?;
+                let world = world::observe_world()?;
                 let mut exec = execute::MacOsExecutor::new(world);
                 execute::execute_plan(&snapshot, &plan, &mut exec, options)
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let world = restore::observe_world()?;
+                let world = world::observe_world()?;
                 let mut sim = execute::SimulatedExecutor::new(world);
                 execute::execute_plan(&snapshot, &plan, &mut sim, options)
             }
         };
 
         journals.push(journal);
-        let verify = restore::verify_workspace(&snapshot)?;
+        let verify = world::verify_workspace(&snapshot)?;
         let accuracy = verify.accuracy;
         final_verify = Some(verify);
 
-        // Converge: stop early when we reach 100% match or the plan is empty.
-        if accuracy >= 0.999 {
+        // Converge: stop early on 100% match, or when the plan had nothing
+        // actionable — re-planning an all-skip world can never change it.
+        if !actionable || accuracy >= 0.999 {
             break;
         }
         if iter + 1 >= max_iters {
             break;
         }
+    }
+
+    // Replay saved stacking order once geometry has settled.
+    if !dry_run {
+        world::replay_z_order(&snapshot);
     }
 
     if json {

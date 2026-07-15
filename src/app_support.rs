@@ -11,6 +11,9 @@ pub struct KnownApp {
     pub bundle_id: &'static str,
     pub name: &'static str,
     pub support: AppSupport,
+    /// Chromium-family browsers whose tabs we capture and restore via the
+    /// shared AppleScript dictionary (`windows`/`tabs`/`URL`).
+    pub tab_capture: bool,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -27,6 +30,8 @@ pub const KNOWN_APPS: &[KnownApp] = &[
             level: SupportLevel::FullRestore,
             reason: "VS Code window geometry and z-order restore are currently supported",
         },
+
+        tab_capture: false,
     },
     KnownApp {
         bundle_id: "com.google.Chrome",
@@ -35,6 +40,8 @@ pub const KNOWN_APPS: &[KnownApp] = &[
             level: SupportLevel::FullRestore,
             reason: "Chrome window geometry and z-order restore are enabled",
         },
+
+        tab_capture: true,
     },
     KnownApp {
         bundle_id: "com.apple.Safari",
@@ -43,6 +50,8 @@ pub const KNOWN_APPS: &[KnownApp] = &[
             level: SupportLevel::FullRestore,
             reason: "Safari window geometry and z-order restore are enabled",
         },
+
+        tab_capture: false,
     },
     KnownApp {
         bundle_id: "com.apple.Terminal",
@@ -51,6 +60,8 @@ pub const KNOWN_APPS: &[KnownApp] = &[
             level: SupportLevel::FullRestore,
             reason: "Terminal window geometry and z-order restore are enabled",
         },
+
+        tab_capture: false,
     },
     KnownApp {
         bundle_id: "com.googlecode.iterm2",
@@ -59,6 +70,8 @@ pub const KNOWN_APPS: &[KnownApp] = &[
             level: SupportLevel::FullRestore,
             reason: "iTerm2 window geometry and z-order restore are enabled",
         },
+
+        tab_capture: false,
     },
     KnownApp {
         bundle_id: "dev.warp.Warp-Stable",
@@ -67,6 +80,8 @@ pub const KNOWN_APPS: &[KnownApp] = &[
             level: SupportLevel::FullRestore,
             reason: "Warp window geometry and z-order restore are enabled",
         },
+
+        tab_capture: false,
     },
     KnownApp {
         bundle_id: "com.todesktop.230313mzl4w4u92",
@@ -75,6 +90,8 @@ pub const KNOWN_APPS: &[KnownApp] = &[
             level: SupportLevel::FullRestore,
             reason: "Cursor window geometry and z-order restore are enabled",
         },
+
+        tab_capture: false,
     },
     KnownApp {
         bundle_id: "com.apple.dt.Xcode",
@@ -83,6 +100,8 @@ pub const KNOWN_APPS: &[KnownApp] = &[
             level: SupportLevel::FullRestore,
             reason: "Xcode window geometry and z-order restore are enabled",
         },
+
+        tab_capture: false,
     },
     KnownApp {
         bundle_id: "com.apple.finder",
@@ -91,6 +110,8 @@ pub const KNOWN_APPS: &[KnownApp] = &[
             level: SupportLevel::FullRestore,
             reason: "Finder window geometry and z-order restore are enabled",
         },
+
+        tab_capture: false,
     },
     KnownApp {
         bundle_id: "com.apple.Notes",
@@ -99,6 +120,8 @@ pub const KNOWN_APPS: &[KnownApp] = &[
             level: SupportLevel::FullRestore,
             reason: "Notes window geometry and z-order restore are enabled",
         },
+
+        tab_capture: false,
     },
     KnownApp {
         bundle_id: "com.apple.Music",
@@ -107,6 +130,8 @@ pub const KNOWN_APPS: &[KnownApp] = &[
             level: SupportLevel::FullRestore,
             reason: "Music window geometry and z-order restore are enabled",
         },
+
+        tab_capture: false,
     },
     KnownApp {
         bundle_id: "com.apple.MobileSMS",
@@ -115,6 +140,44 @@ pub const KNOWN_APPS: &[KnownApp] = &[
             level: SupportLevel::FullRestore,
             reason: "Messages window geometry and z-order restore are enabled",
         },
+
+        tab_capture: false,
+    },
+    KnownApp {
+        bundle_id: "com.google.Chrome.canary",
+        name: "Google Chrome Canary",
+        support: AppSupport {
+            level: SupportLevel::FullRestore,
+            reason: "Chrome Canary window geometry and tab restore are enabled",
+        },
+        tab_capture: true,
+    },
+    KnownApp {
+        bundle_id: "com.brave.Browser",
+        name: "Brave Browser",
+        support: AppSupport {
+            level: SupportLevel::FullRestore,
+            reason: "Brave window geometry and tab restore are enabled",
+        },
+        tab_capture: true,
+    },
+    KnownApp {
+        bundle_id: "com.microsoft.edgemac",
+        name: "Microsoft Edge",
+        support: AppSupport {
+            level: SupportLevel::FullRestore,
+            reason: "Edge window geometry and tab restore are enabled",
+        },
+        tab_capture: true,
+    },
+    KnownApp {
+        bundle_id: "org.chromium.Chromium",
+        name: "Chromium",
+        support: AppSupport {
+            level: SupportLevel::FullRestore,
+            reason: "Chromium window geometry and tab restore are enabled",
+        },
+        tab_capture: true,
     },
 ];
 
@@ -147,6 +210,21 @@ pub fn full_restore_apps() -> impl Iterator<Item = &'static KnownApp> {
     KNOWN_APPS
         .iter()
         .filter(|app| app.support.level == SupportLevel::FullRestore)
+}
+
+/// Browsers whose tabs are captured and restored.
+pub fn tab_capable_apps() -> impl Iterator<Item = &'static KnownApp> {
+    KNOWN_APPS.iter().filter(|app| app.tab_capture)
+}
+
+pub fn is_tab_capable(bundle_id: Option<&str>) -> bool {
+    bundle_id
+        .map(|bundle_id| {
+            KNOWN_APPS
+                .iter()
+                .any(|app| app.bundle_id == bundle_id && app.tab_capture)
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

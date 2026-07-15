@@ -3,7 +3,7 @@ use serde::Serialize;
 use crate::{
     configure::ConfigureReport,
     error::Result,
-    model::{RestoreReport, RestoreStatus, SnapshotListEntry, WorkspaceSnapshot},
+    model::{SnapshotListEntry, WorkspaceSnapshot},
     style,
 };
 
@@ -103,49 +103,6 @@ pub fn print_configure_report(report: &ConfigureReport, changed: bool) {
     }
 }
 
-pub fn print_restore_report(report: &RestoreReport) {
-    let planned = if report.dry_run {
-        style::cyan("planned")
-    } else {
-        style::green("restored")
-    };
-    println!(
-        "{} {}  ({} ok, {} skipped, {} failed)",
-        planned,
-        style::bold(&report.snapshot),
-        report.restored,
-        report.skipped,
-        report.failed
-    );
-
-    for action in &report.actions {
-        let tag = match action.status {
-            RestoreStatus::Planned => style::tag_plan(),
-            RestoreStatus::Restored => style::tag_ok(),
-            RestoreStatus::Skipped => style::tag_skip(),
-            RestoreStatus::Failed => style::tag_fail(),
-        };
-        let title = action.title.as_deref().unwrap_or("(untitled)");
-        let message = action.message.as_deref().unwrap_or("");
-        let msg = if message.is_empty() {
-            String::new()
-        } else {
-            format!("  {}", style::dim(message))
-        };
-        println!(
-            "  {} {:<24} {:>6.0},{:<6.0} {:>5.0}x{:<5.0}  {}{}",
-            tag,
-            action.app_name,
-            action.target_frame.x,
-            action.target_frame.y,
-            action.target_frame.width,
-            action.target_frame.height,
-            title,
-            msg
-        );
-    }
-}
-
 pub fn print_restore_plan(plan: &crate::plan::RestorePlan) {
     let summary = plan.summary();
     println!(
@@ -236,7 +193,7 @@ pub fn print_verify_report(report: &crate::verify::VerifyReport) {
     }
 }
 
-pub fn print_doctor_report(report: &crate::restore::DoctorReport) {
+pub fn print_doctor_report(report: &crate::world::DoctorReport) {
     let line = |ok: bool, label: &str, value: &str| {
         let tag = if ok {
             style::tag_ok()
@@ -275,11 +232,35 @@ pub fn print_doctor_report(report: &crate::restore::DoctorReport) {
     }
 }
 
+pub fn print_selftest_report(report: &crate::selftest::SelftestReport) {
+    let failed = report.failed();
+    let verdict = if failed == 0 {
+        style::green("all checks passed")
+    } else {
+        style::red(&format!("{failed} check(s) failed"))
+    };
+    println!(
+        "{} {} ({}/{})",
+        style::bold("selftest:"),
+        verdict,
+        report.checks.len() - failed,
+        report.checks.len()
+    );
+    for check in &report.checks {
+        let tag = if check.passed {
+            style::tag_ok()
+        } else {
+            style::tag_fail()
+        };
+        println!("  {} {:<34} {}", tag, check.name, style::dim(&check.detail));
+    }
+}
+
 pub fn print_journal(journal: &crate::execute::ExecutionJournal) {
     let counts = journal.counts();
     println!(
         "{} {}  {} ops in {} ms",
-        style::bold("apply:"),
+        style::bold("restore:"),
         journal.snapshot,
         journal.entries.len(),
         journal.duration_ms

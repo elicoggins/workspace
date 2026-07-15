@@ -15,6 +15,8 @@ mod imp {
 
     const MAX_DISPLAYS: usize = 32;
 
+    type CGDisplayModeRef = *const std::ffi::c_void;
+
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
         fn CGGetActiveDisplayList(
@@ -24,8 +26,28 @@ mod imp {
         ) -> CGError;
         fn CGMainDisplayID() -> CGDirectDisplayID;
         fn CGDisplayBounds(display: CGDirectDisplayID) -> CGRect;
-        fn CGDisplayPixelsWide(display: CGDirectDisplayID) -> usize;
-        fn CGDisplayPixelsHigh(display: CGDirectDisplayID) -> usize;
+        fn CGDisplayCopyDisplayMode(display: CGDirectDisplayID) -> CGDisplayModeRef;
+        fn CGDisplayModeGetPixelWidth(mode: CGDisplayModeRef) -> usize;
+        fn CGDisplayModeRelease(mode: CGDisplayModeRef);
+    }
+
+    /// Backing-pixel width ÷ point width. (`CGDisplayPixelsWide` returns
+    /// points on modern macOS, which made every display report ~1.0.)
+    fn display_scale_factor(id: CGDirectDisplayID, point_width: f64) -> f64 {
+        if point_width <= 0.0 {
+            return 1.0;
+        }
+        let mode = unsafe { CGDisplayCopyDisplayMode(id) };
+        if mode.is_null() {
+            return 1.0;
+        }
+        let pixel_width = unsafe { CGDisplayModeGetPixelWidth(mode) } as f64;
+        unsafe { CGDisplayModeRelease(mode) };
+        if pixel_width <= 0.0 {
+            1.0
+        } else {
+            pixel_width / point_width
+        }
     }
 
     pub fn current_displays() -> Result<Vec<DisplaySnapshot>> {
@@ -44,18 +66,11 @@ mod imp {
 
         for id in ids.into_iter().take(count as usize) {
             let bounds = unsafe { CGDisplayBounds(id) };
-            let pixels_wide = unsafe { CGDisplayPixelsWide(id) } as f64;
-            let pixels_high = unsafe { CGDisplayPixelsHigh(id) } as f64;
             let frame = Frame {
                 x: bounds.origin.x,
                 y: bounds.origin.y,
                 width: bounds.size.width,
                 height: bounds.size.height,
-            };
-            let scale_factor = if frame.width > 0.0 {
-                pixels_wide / frame.width
-            } else {
-                1.0
             };
 
             displays.push(DisplaySnapshot {
@@ -63,7 +78,7 @@ mod imp {
                 numeric_id: id,
                 name: None,
                 frame,
-                scale_factor: scale_factor.max(pixels_high / frame.height.max(1.0)),
+                scale_factor: display_scale_factor(id, frame.width),
                 is_primary: id == primary,
             });
         }

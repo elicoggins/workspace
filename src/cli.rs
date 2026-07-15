@@ -6,28 +6,29 @@ use crate::plan::RestoreMode;
 const TOP_AFTER_HELP: &str = "\
 Examples:
   workspace save coding              Capture the current window layout
-  workspace apply coding             Restore it (planner-driven)
-  workspace apply coding --dry-run   Preview without touching the system
+  workspace restore coding           Restore it (plan → execute → verify)
+  workspace restore coding --dry-run Preview without touching the system
   workspace diff coding              See what's different and what would change
   workspace list                     Show all saved workspaces
   workspace doctor                   Check permissions and environment
 
 Run 'workspace <COMMAND> --help' for command-specific options.";
 
-const APPLY_AFTER_HELP: &str = "\
+const RESTORE_AFTER_HELP: &str = "\
 Examples:
-  workspace apply coding
-  workspace apply coding --converge 3            Retry up to 3 times
-  workspace apply coding --mode reconcile        Minimize extras
-  workspace apply coding --dry-run --json        Inspect the plan as JSON";
+  workspace restore coding
+  workspace restore coding --converge 3          Retry up to 3 times
+  workspace restore coding --mode reconcile      Minimize extras
+  workspace restore coding --dry-run --json      Inspect the plan as JSON";
 
 #[derive(Debug, Parser)]
 #[command(
     name = "workspace",
     about = "Save and restore macOS desktop window workspaces",
-    long_about = "Capture the current window layout (apps, geometry, Chrome tabs, displays) to a \
-JSON snapshot, then restore it deterministically. Requires macOS Accessibility permission for \
-restore commands.",
+    long_about = "Capture the current window layout (apps, geometry, browser tabs, displays) to a \
+JSON snapshot, then restore it deterministically with `restore`. Requires macOS Accessibility \
+permission to move windows; grant Screen Recording too so window titles are visible for reliable \
+matching.",
     after_help = TOP_AFTER_HELP,
     version,
     arg_required_else_help = true,
@@ -84,9 +85,9 @@ pub enum Command {
         force: bool,
     },
 
-    /// Apply a snapshot using the planner + executor (recommended)
-    #[command(after_help = APPLY_AFTER_HELP)]
-    Apply {
+    /// Restore a snapshot: plan → execute → verify, with a journal
+    #[command(after_help = RESTORE_AFTER_HELP, alias = "apply")]
+    Restore {
         /// Snapshot name
         name: String,
 
@@ -153,28 +154,6 @@ pub enum Command {
         name: String,
     },
 
-    /// Legacy single-pass restore (equivalent to `apply --converge 1`)
-    Restore {
-        /// Snapshot name
-        name: String,
-
-        /// Show planned changes without moving windows
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Protect VS Code / Cursor from destructive lifecycle actions
-        #[arg(long)]
-        dev_mode: bool,
-
-        /// Restore policy (safe | reconcile | destructive)
-        #[arg(long, value_enum, default_value = "safe")]
-        mode: ModeArg,
-
-        /// Shortcut for --mode destructive
-        #[arg(long)]
-        destructive: bool,
-    },
-
     /// List saved snapshots
     List,
 
@@ -210,6 +189,14 @@ pub enum Command {
 
     /// Check environment: data dir, displays, Accessibility permission
     Doctor,
+
+    /// Exercise the REAL macOS pipeline end-to-end and report PASS/FAIL
+    Selftest {
+        /// Also move one window 40px and restore it via the real executor
+        /// (mutates your desktop briefly)
+        #[arg(long)]
+        live: bool,
+    },
 
     /// Print a shell completion script
     Completions {

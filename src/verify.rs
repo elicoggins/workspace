@@ -6,9 +6,11 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::{BTreeMap, HashSet};
+
 use crate::{
-    model::{Frame, WindowSnapshot, WorkspaceSnapshot},
-    plan::{compute_match_score, restore_skip_reason, MatchScore, WorldState},
+    model::{Frame, WorkspaceSnapshot},
+    plan::{assign_matches, restore_skip_reason, MatchScore, WorldState},
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -56,24 +58,62 @@ pub fn verify(
     let mut matched = 0;
     let mut skipped = 0;
 
-    // Track live windows we've already attributed to a saved window so two
-    // saved windows can't both claim the same live window.
-    let mut consumed: Vec<bool> = vec![false; world.windows.len()];
+    // Windows restore never touches must not count against accuracy —
+    // otherwise any snapshot containing an unsupported app can never verify
+    // at 100% and `restore --converge` never stops early.
+    let mut skip_reasons: Vec<Option<String>> = Vec::with_capacity(snapshot.windows.len());
+    let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (index, window) in snapshot.windows.iter().enumerate() {
+        let reason = restore_skip_reason(window);
+        if reason.is_none() {
+            if let Some(bundle) = window.bundle_id.as_deref() {
+                groups.entry(bundle).or_default().push(index);
+            }
+        }
+        skip_reasons.push(reason);
+    }
+
+    // Match with the planner's assigner (globally best pair first, distinct
+    // live windows) so verify reports exactly what the planner would reuse.
+    let consumed: HashSet<u32> = HashSet::new();
+    let mut match_results: Vec<Option<(usize, MatchScore)>> = vec![None; snapshot.windows.len()];
+    for (bundle, indices) in &groups {
+        let saved_refs: Vec<_> = indices
+            .iter()
+            .map(|index| &snapshot.windows[*index])
+            .collect();
+        let live_indices: Vec<usize> = world
+            .windows
+            .iter()
+            .enumerate()
+            .filter(|(_, live)| live.bundle_id.as_deref() == Some(*bundle))
+            .map(|(live_index, _)| live_index)
+            .collect();
+        let live_refs: Vec<_> = live_indices
+            .iter()
+            .map(|live_index| &world.windows[*live_index])
+            .collect();
+        for (local, assignment) in assign_matches(&saved_refs, &live_refs, &consumed)
+            .into_iter()
+            .enumerate()
+        {
+            if let Some((live_local, score)) = assignment {
+                match_results[indices[local]] = Some((live_indices[live_local], score));
+            }
+        }
+    }
 
     for (index, window) in snapshot.windows.iter().enumerate() {
         let expected = target_frames[index];
 
-        // Windows restore never touches must not count against accuracy —
-        // otherwise any snapshot containing an unsupported app can never
-        // verify at 100% and `apply --converge` never stops early.
-        if let Some(reason) = restore_skip_reason(window) {
+        if let Some(reason) = &skip_reasons[index] {
             skipped += 1;
             entries.push(VerifyEntry {
                 saved_window_index: index,
                 app_name: window.app_name.clone(),
                 bundle_id: window.bundle_id.clone(),
                 matched: false,
-                skipped_reason: Some(reason),
+                skipped_reason: Some(reason.clone()),
                 match_score: None,
                 expected_frame: expected,
                 observed_frame: None,
@@ -82,11 +122,8 @@ pub fn verify(
             continue;
         }
 
-        let candidate = pick_best_live(window, world, &consumed);
-
-        match candidate {
+        match match_results[index] {
             Some((live_index, score)) => {
-                consumed[live_index] = true;
                 let observed = world.windows[live_index].frame;
                 let delta = frame_delta(expected, observed);
                 total_delta += delta;
@@ -151,31 +188,6 @@ pub fn verify(
     }
 }
 
-fn pick_best_live(
-    saved: &WindowSnapshot,
-    world: &WorldState,
-    consumed: &[bool],
-) -> Option<(usize, MatchScore)> {
-    let mut best: Option<(usize, MatchScore)> = None;
-    for (index, live) in world.windows.iter().enumerate() {
-        if consumed[index] {
-            continue;
-        }
-        if live.bundle_id != saved.bundle_id {
-            continue;
-        }
-        let score = compute_match_score(saved, live);
-        if score.final_score < MatchScore::MIN_ACCEPT {
-            continue;
-        }
-        match &best {
-            Some((_, current)) if current.final_score >= score.final_score => continue,
-            _ => best = Some((index, score)),
-        }
-    }
-    best
-}
-
 fn frame_delta(a: Frame, b: Frame) -> f64 {
     let dx = (a.x - b.x).abs();
     let dy = (a.y - b.y).abs();
@@ -191,7 +203,7 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
-    use crate::model::{HostInfo, SNAPSHOT_VERSION};
+    use crate::model::{HostInfo, WindowSnapshot, SNAPSHOT_VERSION};
     use crate::plan::LiveWindow;
 
     fn snapshot(window: WindowSnapshot) -> WorkspaceSnapshot {

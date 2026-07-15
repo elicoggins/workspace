@@ -3,6 +3,16 @@ use crate::{
     model::{Frame, WindowSnapshot},
 };
 
+/// AX-visible state of one window, including the flags the CG window list
+/// cannot report.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AxWindowState {
+    pub title: Option<String>,
+    pub frame: Option<Frame>,
+    pub minimized: bool,
+    pub fullscreen: bool,
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use core_foundation::base::{CFRelease, CFTypeRef};
@@ -63,10 +73,15 @@ mod imp {
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
         static kCFBooleanTrue: CFTypeRef;
+        static kCFBooleanFalse: CFTypeRef;
     }
 
-    pub(super) unsafe fn k_cf_boolean_true() -> CFTypeRef {
-        kCFBooleanTrue
+    pub(super) unsafe fn k_cf_boolean(value: bool) -> CFTypeRef {
+        if value {
+            kCFBooleanTrue
+        } else {
+            kCFBooleanFalse
+        }
     }
 
     pub fn ensure_trusted() -> Result<()> {
@@ -94,32 +109,6 @@ mod imp {
         result
     }
 
-    pub fn set_window_frames(pid: i32, targets: &[(&WindowSnapshot, Frame)]) -> Result<Vec<bool>> {
-        tracing::debug!(
-            pid,
-            count = targets.len(),
-            "creating AX application element for batch restore"
-        );
-        let application = unsafe { AXUIElementCreateApplication(pid) };
-        if application.is_null() {
-            return Ok(vec![false; targets.len()]);
-        }
-
-        let result = set_window_frames_for_application(application, targets);
-        unsafe { CFRelease(application as CFTypeRef) };
-        result
-    }
-
-    pub fn window_count(pid: i32) -> Result<usize> {
-        let application = unsafe { AXUIElementCreateApplication(pid) };
-        if application.is_null() {
-            return Ok(0);
-        }
-        let result = window_count_for_application(application);
-        unsafe { CFRelease(application as CFTypeRef) };
-        result
-    }
-
     pub fn raise_window(pid: i32, saved: &WindowSnapshot) -> Result<bool> {
         tracing::debug!(pid, app = %saved.app_name, "creating AX application element for raise");
         let application = unsafe { AXUIElementCreateApplication(pid) };
@@ -133,15 +122,22 @@ mod imp {
     }
 
     pub fn minimize_window(pid: i32, saved: &WindowSnapshot) -> Result<bool> {
+        set_window_minimized(pid, saved, true)
+    }
+
+    pub fn unminimize_window(pid: i32, saved: &WindowSnapshot) -> Result<bool> {
+        set_window_minimized(pid, saved, false)
+    }
+
+    fn set_window_minimized(pid: i32, saved: &WindowSnapshot, minimized: bool) -> Result<bool> {
         let application = unsafe { AXUIElementCreateApplication(pid) };
         if application.is_null() {
             return Ok(false);
         }
         let result = with_matching_window(application, saved, |window| {
-            // Set AXMinimized = true via a CFBoolean true.
             let key = cf_string("AXMinimized");
-            let true_val: CFTypeRef = unsafe { k_cf_boolean_true() };
-            let error = unsafe { AXUIElementSetAttributeValue(window, key, true_val) };
+            let value: CFTypeRef = unsafe { k_cf_boolean(minimized) };
+            let error = unsafe { AXUIElementSetAttributeValue(window, key, value) };
             unsafe { CFRelease(key as CFTypeRef) };
             if error == K_AX_ERROR_SUCCESS {
                 Ok(true)
@@ -154,6 +150,47 @@ mod imp {
         .map(|matched| matched.unwrap_or(false));
         unsafe { CFRelease(application as CFTypeRef) };
         result
+    }
+
+    /// Per-window AX state for one process: title, frame, and the two flags
+    /// the CG window list cannot see (minimized windows are absent from it
+    /// entirely; fullscreen status is invisible).
+    pub fn ax_window_states(pid: i32) -> Result<Vec<AxWindowState>> {
+        let application = unsafe { AXUIElementCreateApplication(pid) };
+        if application.is_null() {
+            return Ok(Vec::new());
+        }
+
+        let windows_key = cf_string("AXWindows");
+        let mut windows_value: CFTypeRef = std::ptr::null();
+        let error =
+            unsafe { AXUIElementCopyAttributeValue(application, windows_key, &mut windows_value) };
+        unsafe { CFRelease(windows_key as CFTypeRef) };
+        if error != K_AX_ERROR_SUCCESS || windows_value.is_null() {
+            unsafe { CFRelease(application as CFTypeRef) };
+            return Ok(Vec::new());
+        }
+
+        let mut states = Vec::new();
+        unsafe {
+            let array = windows_value as *mut Object;
+            let count: usize = msg_send![array, count];
+            for index in 0..count {
+                let window: AXUIElementRef = msg_send![array, objectAtIndex: index];
+                if window.is_null() {
+                    continue;
+                }
+                states.push(AxWindowState {
+                    title: copy_string_attribute(window, "AXTitle"),
+                    frame: read_frame(window),
+                    minimized: copy_bool_attribute(window, "AXMinimized").unwrap_or(false),
+                    fullscreen: copy_bool_attribute(window, "AXFullScreen").unwrap_or(false),
+                });
+            }
+            CFRelease(windows_value);
+            CFRelease(application as CFTypeRef);
+        }
+        Ok(states)
     }
 
     pub fn close_window(pid: i32, saved: &WindowSnapshot) -> Result<bool> {
@@ -186,70 +223,6 @@ mod imp {
     ) -> Result<bool> {
         with_matching_window(application, saved, |window| set_and_verify(window, target))
             .map(|matched| matched.unwrap_or(false))
-    }
-
-    fn set_window_frames_for_application(
-        application: AXUIElementRef,
-        targets: &[(&WindowSnapshot, Frame)],
-    ) -> Result<Vec<bool>> {
-        let app_name = targets
-            .first()
-            .map(|target| target.0.app_name.as_str())
-            .unwrap_or("unknown");
-        let Some((windows_value, candidates)) = candidate_windows(application, app_name)? else {
-            return Ok(vec![false; targets.len()]);
-        };
-
-        let saved: Vec<WindowMatchInput> = targets
-            .iter()
-            .map(|(window, _)| WindowMatchInput {
-                title: window.title.clone(),
-                frame: window.frame,
-            })
-            .collect();
-        let candidate_inputs: Vec<WindowMatchInput> = candidates
-            .iter()
-            .map(|candidate| WindowMatchInput {
-                title: candidate.title.clone(),
-                frame: candidate.frame,
-            })
-            .collect();
-        let assignments = assign_distinct_windows(&saved, &candidate_inputs);
-        let mut results = vec![false; targets.len()];
-
-        for (target_index, assignment) in assignments.into_iter().enumerate() {
-            let Some(candidate_index) = assignment else {
-                continue;
-            };
-            results[target_index] = set_and_verify_for_app(
-                app_name,
-                candidates[candidate_index].element,
-                targets[target_index].1,
-            )?;
-        }
-
-        unsafe { CFRelease(windows_value) };
-        Ok(results)
-    }
-
-    fn window_count_for_application(application: AXUIElementRef) -> Result<usize> {
-        let windows_key = cf_string("AXWindows");
-        let mut windows_value: CFTypeRef = std::ptr::null();
-        let error =
-            unsafe { AXUIElementCopyAttributeValue(application, windows_key, &mut windows_value) };
-        unsafe { CFRelease(windows_key as CFTypeRef) };
-
-        if error != K_AX_ERROR_SUCCESS || windows_value.is_null() {
-            return Ok(0);
-        }
-
-        let count = unsafe {
-            let array = windows_value as *mut Object;
-            let count: usize = msg_send![array, count];
-            count
-        };
-        unsafe { CFRelease(windows_value) };
-        Ok(count)
     }
 
     fn raise_window_for_application(
@@ -312,93 +285,6 @@ mod imp {
         result
     }
 
-    struct AxWindowCandidate {
-        element: AXUIElementRef,
-        title: Option<String>,
-        frame: Frame,
-    }
-
-    #[derive(Debug, Clone)]
-    pub(super) struct WindowMatchInput {
-        pub(super) title: Option<String>,
-        pub(super) frame: Frame,
-    }
-
-    fn candidate_windows(
-        application: AXUIElementRef,
-        app_name: &str,
-    ) -> Result<Option<(CFTypeRef, Vec<AxWindowCandidate>)>> {
-        let windows_key = cf_string("AXWindows");
-        let mut windows_value: CFTypeRef = std::ptr::null();
-        tracing::debug!(app = %app_name, "copying AX windows attribute");
-        let error =
-            unsafe { AXUIElementCopyAttributeValue(application, windows_key, &mut windows_value) };
-        unsafe { CFRelease(windows_key as CFTypeRef) };
-
-        if error != K_AX_ERROR_SUCCESS || windows_value.is_null() {
-            return Ok(None);
-        }
-
-        let mut candidates = Vec::new();
-        unsafe {
-            let array = windows_value as *mut Object;
-            let count: usize = msg_send![array, count];
-            tracing::debug!(app = %app_name, count, "reading AX windows");
-            for index in 0..count {
-                let window: AXUIElementRef = msg_send![array, objectAtIndex: index];
-                if window.is_null() {
-                    continue;
-                }
-                candidates.push(AxWindowCandidate {
-                    element: window,
-                    title: copy_string_attribute(window, "AXTitle"),
-                    frame: read_frame(window).unwrap_or(Frame {
-                        x: 0.0,
-                        y: 0.0,
-                        width: 0.0,
-                        height: 0.0,
-                    }),
-                });
-            }
-        }
-
-        Ok(Some((windows_value, candidates)))
-    }
-
-    pub(super) fn assign_distinct_windows(
-        saved: &[WindowMatchInput],
-        candidates: &[WindowMatchInput],
-    ) -> Vec<Option<usize>> {
-        let mut pairs = Vec::new();
-        for (saved_index, saved_window) in saved.iter().enumerate() {
-            for (candidate_index, candidate) in candidates.iter().enumerate() {
-                pairs.push((
-                    score_match(
-                        saved_window.title.as_deref(),
-                        saved_window.frame,
-                        candidate.title.as_deref(),
-                        candidate.frame,
-                    ),
-                    saved_index,
-                    candidate_index,
-                ));
-            }
-        }
-        pairs.sort_by_key(|pair| std::cmp::Reverse(pair.0));
-
-        let mut assignments = vec![None; saved.len()];
-        let mut used_candidates = vec![false; candidates.len()];
-        for (_, saved_index, candidate_index) in pairs {
-            if assignments[saved_index].is_some() || used_candidates[candidate_index] {
-                continue;
-            }
-            assignments[saved_index] = Some(candidate_index);
-            used_candidates[candidate_index] = true;
-        }
-
-        assignments
-    }
-
     fn set_and_verify(window: AXUIElementRef, target: Frame) -> Result<bool> {
         set_size(window, target)?;
         set_position(window, target)?;
@@ -415,20 +301,6 @@ mod imp {
         Ok(read_frame(window)
             .map(|frame| frames_close(frame, target))
             .unwrap_or(true))
-    }
-
-    fn set_and_verify_for_app(
-        app_name: &str,
-        window: AXUIElementRef,
-        target: Frame,
-    ) -> Result<bool> {
-        if app_name == "Google Chrome" {
-            set_size(window, target)?;
-            set_position(window, target)?;
-            return Ok(true);
-        }
-
-        set_and_verify(window, target)
     }
 
     fn set_position(window: AXUIElementRef, frame: Frame) -> Result<()> {
@@ -546,6 +418,23 @@ mod imp {
         }
     }
 
+    fn copy_bool_attribute(window: AXUIElementRef, attribute: &str) -> Option<bool> {
+        let key = cf_string(attribute);
+        let mut value: CFTypeRef = std::ptr::null();
+        let error = unsafe { AXUIElementCopyAttributeValue(window, key, &mut value) };
+        unsafe { CFRelease(key as CFTypeRef) };
+        if error != K_AX_ERROR_SUCCESS || value.is_null() {
+            return None;
+        }
+        let result = unsafe {
+            let object = value as *mut Object;
+            let flag: bool = msg_send![object, boolValue];
+            CFRelease(value);
+            flag
+        };
+        Some(result)
+    }
+
     fn copy_string_attribute(window: AXUIElementRef, attribute: &str) -> Option<String> {
         let key = cf_string(attribute);
         let mut value: CFTypeRef = std::ptr::null();
@@ -621,59 +510,28 @@ mod imp {
         Err(WorkspaceError::UnsupportedPlatform)
     }
 
-    pub fn set_window_frames(
-        _pid: i32,
-        _targets: &[(&WindowSnapshot, Frame)],
-    ) -> Result<Vec<bool>> {
-        Err(WorkspaceError::UnsupportedPlatform)
-    }
-
-    pub fn window_count(_pid: i32) -> Result<usize> {
-        Err(WorkspaceError::UnsupportedPlatform)
-    }
-
     pub fn raise_window(_pid: i32, _saved: &WindowSnapshot) -> Result<bool> {
         Err(WorkspaceError::UnsupportedPlatform)
+    }
+
+    pub fn minimize_window(_pid: i32, _saved: &WindowSnapshot) -> Result<bool> {
+        Err(WorkspaceError::UnsupportedPlatform)
+    }
+
+    pub fn unminimize_window(_pid: i32, _saved: &WindowSnapshot) -> Result<bool> {
+        Err(WorkspaceError::UnsupportedPlatform)
+    }
+
+    pub fn close_window(_pid: i32, _saved: &WindowSnapshot) -> Result<bool> {
+        Err(WorkspaceError::UnsupportedPlatform)
+    }
+
+    pub fn ax_window_states(_pid: i32) -> Result<Vec<AxWindowState>> {
+        Ok(Vec::new())
     }
 }
 
 pub use imp::{
-    close_window, ensure_trusted, is_trusted, minimize_window, raise_window, set_window_frame,
-    set_window_frames, window_count,
+    ax_window_states, close_window, ensure_trusted, is_trusted, minimize_window, raise_window,
+    set_window_frame, unminimize_window,
 };
-
-#[cfg(all(test, target_os = "macos"))]
-mod tests {
-    use super::imp::{assign_distinct_windows, WindowMatchInput};
-    use crate::model::Frame;
-
-    fn input(title: &str, x: f64) -> WindowMatchInput {
-        WindowMatchInput {
-            title: Some(title.to_string()),
-            frame: Frame {
-                x,
-                y: 0.0,
-                width: 800.0,
-                height: 600.0,
-            },
-        }
-    }
-
-    #[test]
-    fn assigns_saved_windows_to_distinct_candidates() {
-        let saved = vec![
-            input("Docs", 0.0),
-            input("Docs", 900.0),
-            input("Docs", 1800.0),
-        ];
-        let candidates = vec![
-            input("Docs", 1800.0),
-            input("Docs", 0.0),
-            input("Docs", 900.0),
-        ];
-
-        let assignments = assign_distinct_windows(&saved, &candidates);
-
-        assert_eq!(assignments, vec![Some(1), Some(2), Some(0)]);
-    }
-}

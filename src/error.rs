@@ -56,6 +56,9 @@ pub enum WorkspaceError {
         found: u32,
         supported: u32,
     },
+
+    #[error("selftest failed: {failed} of {total} checks did not pass")]
+    SelftestFailed { failed: usize, total: usize },
 }
 
 impl WorkspaceError {
@@ -67,6 +70,7 @@ impl WorkspaceError {
             WorkspaceError::AccessibilityPermissionRequired => 5,
             WorkspaceError::UnsupportedPlatform => 6,
             WorkspaceError::UnsupportedSnapshotVersion { .. } => 7,
+            WorkspaceError::SelftestFailed { .. } => 8,
             _ => 1,
         }
     }
