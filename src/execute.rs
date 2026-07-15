@@ -769,7 +769,31 @@ impl Executor for MacOsExecutor {
         target: Frame,
     ) -> Result<OpOutcome> {
         match crate::macos::accessibility::set_window_frame(pid, saved, target) {
-            Ok(true) => Ok(OpOutcome::success("repositioned".to_string())),
+            Ok(true) => {
+                // A matched Chrome window keeps its identity, but the user may
+                // have closed some of its saved tabs — re-open the missing
+                // ones (add-only; nothing the user has open is touched).
+                if saved.bundle_id.as_deref() == Some("com.google.Chrome")
+                    && !saved.browser_tabs.is_empty()
+                {
+                    return Ok(
+                        match crate::macos::chrome::reconcile_window_tabs(saved, target) {
+                            Ok(Some(0)) => OpOutcome::success("repositioned".to_string()),
+                            Ok(Some(n)) => OpOutcome::success(format!(
+                                "repositioned; reopened {n} missing tab(s)"
+                            )),
+                            Ok(None) => OpOutcome::partial(
+                                "repositioned; could not locate window to reconcile tabs"
+                                    .to_string(),
+                            ),
+                            Err(e) => OpOutcome::partial(format!(
+                                "repositioned; tab reconcile failed: {e}"
+                            )),
+                        },
+                    );
+                }
+                Ok(OpOutcome::success("repositioned".to_string()))
+            }
             Ok(false) => Ok(OpOutcome::partial("AX match failed".to_string())),
             Err(e) => Ok(OpOutcome::failed(e.to_string())),
         }

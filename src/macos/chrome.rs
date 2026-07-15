@@ -151,6 +151,101 @@ function run(argv) {
 }
 "#;
 
+    /// Re-open saved tabs that are missing from an already-matched live
+    /// window. Safe by construction: only ADDS tabs (by URL), never closes
+    /// or reorders anything the user has open. The window is located by its
+    /// bounds — the executor has just AX-moved it to `target`.
+    const RECONCILE_SCRIPT: &str = r#"
+function run(argv) {
+  const spec = JSON.parse(argv[0]);
+  const chrome = Application('Google Chrome');
+  if (!chrome.running()) return 'error: chrome not running';
+  const wins = chrome.windows();
+  let best = null, bestDist = Infinity;
+  for (let i = 0; i < wins.length; i++) {
+    let b;
+    try { b = wins[i].bounds(); } catch (e) { continue; }
+    const d = Math.abs(b.x - spec.x) + Math.abs(b.y - spec.y) +
+              Math.abs(b.width - spec.width) + Math.abs(b.height - spec.height);
+    if (d < bestDist) { bestDist = d; best = wins[i]; }
+  }
+  if (!best || bestDist > 40) return 'error: no window near target bounds (dist ' + bestDist + ')';
+  const existing = best.tabs().map(function (t) {
+    try { return t.url() || ''; } catch (e) { return ''; }
+  });
+  // Identity guard: if the window shares NO saved tab and is not a blank
+  // new-tab window, the geometry match picked a different window (likely
+  // because the saved one was closed). Grafting saved tabs onto it would
+  // pollute an unrelated window — skip instead.
+  const isBlankWindow = existing.length === 1 &&
+    (existing[0] === '' || existing[0].indexOf('chrome://newtab') === 0);
+  const overlap = existing.filter(function (u) { return spec.urls.indexOf(u) !== -1; }).length;
+  if (!isBlankWindow && overlap === 0) return 'error: matched window shares no saved tabs; not reconciling';
+  let added = 0;
+  for (let i = 0; i < spec.urls.length; i++) {
+    if (existing.indexOf(spec.urls[i]) === -1) {
+      try { best.tabs.push(chrome.Tab({ url: spec.urls[i] })); added++; } catch (e) {}
+    }
+  }
+  if (spec.activeUrl) {
+    const now = best.tabs().map(function (t) {
+      try { return t.url() || ''; } catch (e) { return ''; }
+    });
+    const idx = now.indexOf(spec.activeUrl);
+    if (idx !== -1) { try { best.activeTabIndex = idx + 1; } catch (e) {} }
+  }
+  return 'added ' + added;
+}
+"#;
+
+    /// Returns `Ok(Some(n))` with the number of re-opened tabs, or `Ok(None)`
+    /// when the target window could not be located.
+    pub fn reconcile_window_tabs(saved: &WindowSnapshot, target: Frame) -> Result<Option<usize>> {
+        if saved.browser_tabs.is_empty() {
+            return Ok(Some(0));
+        }
+        let spec = serde_json::json!({
+            "urls": saved.browser_tabs.iter().map(|t| t.url.as_str()).collect::<Vec<_>>(),
+            "activeUrl": saved.browser_tabs.iter().find(|t| t.active).map(|t| t.url.as_str()),
+            "x": target.x.round() as i64,
+            "y": target.y.round() as i64,
+            "width": target.width.round() as i64,
+            "height": target.height.round() as i64,
+        })
+        .to_string();
+        tracing::debug!(%spec, "running Chrome tab reconcile");
+        let output = Command::new("/usr/bin/osascript")
+            .arg("-l")
+            .arg("JavaScript")
+            .arg("-e")
+            .arg(RECONCILE_SCRIPT)
+            .arg(&spec)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|source| {
+                WorkspaceError::MacOs(format!("failed to run Chrome reconcile script: {source}"))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WorkspaceError::MacOs(format!(
+                "Chrome reconcile script exited with {}: {}",
+                output.status,
+                stderr.trim()
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = stdout.trim();
+        if let Some(count) = stdout.strip_prefix("added ") {
+            Ok(count.parse::<usize>().ok())
+        } else {
+            tracing::warn!(%stdout, "Chrome tab reconcile could not locate window");
+            Ok(None)
+        }
+    }
+
     pub fn restore_windows(windows: &[(&WindowSnapshot, Frame)]) -> Result<bool> {
         if windows.is_empty() {
             return Ok(true);
@@ -257,9 +352,16 @@ mod imp {
     pub fn restore_windows(_windows: &[(&WindowSnapshot, Frame)]) -> Result<bool> {
         Err(WorkspaceError::UnsupportedPlatform)
     }
+
+    pub fn reconcile_window_tabs(
+        _saved: &WindowSnapshot,
+        _target: Frame,
+    ) -> Result<Option<usize>> {
+        Err(WorkspaceError::UnsupportedPlatform)
+    }
 }
 
-pub use imp::{capture_windows, restore_windows};
+pub use imp::{capture_windows, reconcile_window_tabs, restore_windows};
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
