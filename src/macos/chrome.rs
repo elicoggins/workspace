@@ -95,6 +95,16 @@ function run(argv) {
       try { return w.id(); } catch (e) { return null; }
     });
   };
+  // A freshly created window's initial tab materializes asynchronously;
+  // when Chrome is busy (e.g. it just processed an AX reposition) indexing
+  // tabs[0] immediately throws "Wrong index". Poll until the tab exists.
+  const waitForFirstTab = function (w) {
+    for (let i = 0; i < 40; i++) {
+      try { if (w.tabs().length > 0) return true; } catch (e) {}
+      delay(0.05);
+    }
+    return false;
+  };
   specs.forEach(function (spec, specIndex) {
     try {
       let target = null;
@@ -109,16 +119,23 @@ function run(argv) {
         // The object handed to push() does not track the created window;
         // re-acquire it by diffing window ids before and after.
         const before = windowIds();
-        chrome.windows.push(chrome.Window());
-        const after = chrome.windows();
-        for (let i = 0; i < after.length; i++) {
-          let id;
-          try { id = after[i].id(); } catch (e) { continue; }
-          if (before.indexOf(id) === -1) { target = after[i]; used.push(id); break; }
+        // push() can throw "Wrong index" while Chrome is busy (e.g. right
+        // after an AX reposition) even though the window IS created — ignore
+        // the throw and locate the new window by id-diff below.
+        try { chrome.windows.push(chrome.Window()); } catch (e) {}
+        for (let attempt = 0; attempt < 40 && !target; attempt++) {
+          const after = chrome.windows();
+          for (let i = 0; i < after.length; i++) {
+            let id;
+            try { id = after[i].id(); } catch (e) { continue; }
+            if (before.indexOf(id) === -1) { target = after[i]; used.push(id); break; }
+          }
+          if (!target) delay(0.05);
         }
         if (!target) throw new Error('created a window but could not find it');
       }
       if (spec.urls.length > 0) {
+        if (!waitForFirstTab(target)) throw new Error('window has no tabs after waiting');
         target.tabs[0].url = spec.urls[0];
         for (let i = 1; i < spec.urls.length; i++) {
           target.tabs.push(chrome.Tab({ url: spec.urls[i] }));
