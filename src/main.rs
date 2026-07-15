@@ -21,7 +21,22 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("workspace: {error}");
+            use workspace::error::WorkspaceError;
+            use workspace::style;
+            eprintln!("{} {error}", style::red("error:"));
+            // Helpful follow-up hints for common failures.
+            match &error {
+                WorkspaceError::NotFound(_) => {
+                    eprintln!("       try: workspace list");
+                }
+                WorkspaceError::AlreadyExists(name) => {
+                    eprintln!("       try: workspace save {name} --force");
+                }
+                WorkspaceError::AccessibilityPermissionRequired => {
+                    eprintln!("       open: System Settings → Privacy & Security → Accessibility");
+                }
+                _ => {}
+            }
             ExitCode::from(error.exit_code())
         }
     }

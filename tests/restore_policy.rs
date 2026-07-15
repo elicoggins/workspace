@@ -79,6 +79,7 @@ fn dry_run_plans_supported_windows_and_skips_unknown_windows() {
             window(None, "Unknown", 3),
         ]),
         RestoreOptions {
+            mode: Default::default(),
             dry_run: true,
             dev_mode: false,
         },
@@ -115,6 +116,7 @@ fn dry_run_plans_every_known_app() {
     let report = restore_workspace(
         &snapshot(windows),
         RestoreOptions {
+            mode: Default::default(),
             dry_run: true,
             dev_mode: false,
         },
@@ -148,6 +150,7 @@ fn dry_run_plans_multiple_windows_for_every_known_app() {
     let report = restore_workspace(
         &snapshot(windows),
         RestoreOptions {
+            mode: Default::default(),
             dry_run: true,
             dev_mode: false,
         },
@@ -172,6 +175,7 @@ fn fullscreen_supported_windows_are_still_skipped() {
     let report = restore_workspace(
         &snapshot(vec![vscode]),
         RestoreOptions {
+            mode: Default::default(),
             dry_run: true,
             dev_mode: false,
         },
@@ -194,6 +198,7 @@ fn disabled_windows_are_skipped_before_restore() {
     let report = restore_workspace(
         &snapshot(vec![vscode]),
         RestoreOptions {
+            mode: Default::default(),
             dry_run: true,
             dev_mode: false,
         },

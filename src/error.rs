@@ -47,6 +47,15 @@ pub enum WorkspaceError {
 
     #[error("Accessibility permission is required to restore windows. Grant access in System Settings > Privacy & Security > Accessibility, then rerun restore.")]
     AccessibilityPermissionRequired,
+
+    #[error(
+        "snapshot '{name}' uses schema version {found}, but this build only understands up to {supported}. Upgrade the workspace CLI to load it."
+    )]
+    UnsupportedSnapshotVersion {
+        name: String,
+        found: u32,
+        supported: u32,
+    },
 }
 
 impl WorkspaceError {
@@ -57,6 +66,7 @@ impl WorkspaceError {
             WorkspaceError::AlreadyExists(_) => 4,
             WorkspaceError::AccessibilityPermissionRequired => 5,
             WorkspaceError::UnsupportedPlatform => 6,
+            WorkspaceError::UnsupportedSnapshotVersion { .. } => 7,
             _ => 1,
         }
     }

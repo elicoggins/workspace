@@ -112,3 +112,47 @@ fn old_snapshots_default_windows_to_enabled() {
 
     assert!(decoded.windows[0].enabled);
 }
+
+#[test]
+fn snapshot_store_rejects_future_schema_versions() {
+    use std::fs;
+    use workspace::error::WorkspaceError;
+    use workspace::storage::SnapshotStore;
+
+    let tmp = tempdir_path("workspace-future-version");
+    fs::create_dir_all(&tmp).unwrap();
+    let store = SnapshotStore::new(tmp.clone()).unwrap();
+
+    let path = tmp.join("future.json");
+    let body = serde_json::json!({
+        "version": 999,
+        "name": "future",
+        "created_at": "2030-01-01T00:00:00Z",
+        "host": { "hostname": "h", "os": "macos", "arch": "aarch64" },
+        "displays": [],
+        "windows": []
+    });
+    fs::write(&path, serde_json::to_vec_pretty(&body).unwrap()).unwrap();
+
+    let err = store.load("future").unwrap_err();
+    match err {
+        WorkspaceError::UnsupportedSnapshotVersion {
+            name,
+            found,
+            supported,
+        } => {
+            assert_eq!(name, "future");
+            assert_eq!(found, 999);
+            assert!(supported < 999);
+        }
+        other => panic!("expected UnsupportedSnapshotVersion, got {other:?}"),
+    }
+}
+
+fn tempdir_path(prefix: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}-{nanos}"))
+}

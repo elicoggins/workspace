@@ -60,6 +60,15 @@ mod imp {
         ) -> CFStringRef;
     }
 
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        static kCFBooleanTrue: CFTypeRef;
+    }
+
+    pub(super) unsafe fn k_cf_boolean_true() -> CFTypeRef {
+        kCFBooleanTrue
+    }
+
     pub fn ensure_trusted() -> Result<()> {
         let trusted = unsafe { AXIsProcessTrusted() };
         if trusted {
@@ -67,6 +76,10 @@ mod imp {
         } else {
             Err(WorkspaceError::AccessibilityPermissionRequired)
         }
+    }
+
+    pub fn is_trusted() -> bool {
+        unsafe { AXIsProcessTrusted() }
     }
 
     pub fn set_window_frame(pid: i32, saved: &WindowSnapshot, target: Frame) -> Result<bool> {
@@ -115,6 +128,53 @@ mod imp {
         }
 
         let result = raise_window_for_application(application, saved);
+        unsafe { CFRelease(application as CFTypeRef) };
+        result
+    }
+
+    pub fn minimize_window(pid: i32, saved: &WindowSnapshot) -> Result<bool> {
+        let application = unsafe { AXUIElementCreateApplication(pid) };
+        if application.is_null() {
+            return Ok(false);
+        }
+        let result = with_matching_window(application, saved, |window| {
+            // Set AXMinimized = true via a CFBoolean true.
+            let key = cf_string("AXMinimized");
+            let true_val: CFTypeRef = unsafe { k_cf_boolean_true() };
+            let error = unsafe { AXUIElementSetAttributeValue(window, key, true_val) };
+            unsafe { CFRelease(key as CFTypeRef) };
+            if error == K_AX_ERROR_SUCCESS {
+                Ok(true)
+            } else {
+                Err(WorkspaceError::MacOs(format!(
+                    "AXUIElementSetAttributeValue(AXMinimized) returned {error}"
+                )))
+            }
+        })
+        .map(|matched| matched.unwrap_or(false));
+        unsafe { CFRelease(application as CFTypeRef) };
+        result
+    }
+
+    pub fn close_window(pid: i32, saved: &WindowSnapshot) -> Result<bool> {
+        let application = unsafe { AXUIElementCreateApplication(pid) };
+        if application.is_null() {
+            return Ok(false);
+        }
+        let result = with_matching_window(application, saved, |window| {
+            // Find AXCloseButton subelement and perform AXPress.
+            let key = cf_string("AXCloseButton");
+            let mut button: CFTypeRef = std::ptr::null();
+            let error = unsafe { AXUIElementCopyAttributeValue(window, key, &mut button) };
+            unsafe { CFRelease(key as CFTypeRef) };
+            if error != K_AX_ERROR_SUCCESS || button.is_null() {
+                return Ok(false);
+            }
+            let pressed = perform_action(button as AXUIElementRef, "AXPress")?;
+            unsafe { CFRelease(button) };
+            Ok(pressed)
+        })
+        .map(|matched| matched.unwrap_or(false));
         unsafe { CFRelease(application as CFTypeRef) };
         result
     }
@@ -553,6 +613,10 @@ mod imp {
         Err(WorkspaceError::UnsupportedPlatform)
     }
 
+    pub fn is_trusted() -> bool {
+        false
+    }
+
     pub fn set_window_frame(_pid: i32, _saved: &WindowSnapshot, _target: Frame) -> Result<bool> {
         Err(WorkspaceError::UnsupportedPlatform)
     }
@@ -573,7 +637,10 @@ mod imp {
     }
 }
 
-pub use imp::{ensure_trusted, raise_window, set_window_frame, set_window_frames, window_count};
+pub use imp::{
+    close_window, ensure_trusted, is_trusted, minimize_window, raise_window, set_window_frame,
+    set_window_frames, window_count,
+};
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {

@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     error::{Result, WorkspaceError},
-    model::{SnapshotListEntry, WorkspaceSnapshot},
+    model::{SnapshotListEntry, WorkspaceSnapshot, SNAPSHOT_VERSION},
 };
 
 #[derive(Debug, Clone)]
@@ -29,6 +29,10 @@ impl SnapshotStore {
             source,
         })?;
         Ok(Self { root })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     pub fn save(&self, snapshot: &WorkspaceSnapshot, force: bool) -> Result<PathBuf> {
@@ -80,8 +84,16 @@ impl SnapshotStore {
             path: path.clone(),
             source,
         })?;
-        serde_json::from_slice(&bytes)
-            .map_err(|source| WorkspaceError::ParseSnapshot { path, source })
+        let snapshot: WorkspaceSnapshot = serde_json::from_slice(&bytes)
+            .map_err(|source| WorkspaceError::ParseSnapshot { path, source })?;
+        if snapshot.version > SNAPSHOT_VERSION {
+            return Err(WorkspaceError::UnsupportedSnapshotVersion {
+                name: name.to_string(),
+                found: snapshot.version,
+                supported: SNAPSHOT_VERSION,
+            });
+        }
+        Ok(snapshot)
     }
 
     pub fn list(&self) -> Result<Vec<SnapshotListEntry>> {

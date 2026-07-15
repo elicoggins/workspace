@@ -12,8 +12,10 @@ name = "workspace"
 path = "src/main.rs"
 
 [dependencies]
+anstyle = "1.0"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
 core-foundation = "0.10"
 core-graphics = "0.24"
 dirs = "5.0"
@@ -28,6 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
 tempfile = "3.10"
+proptest = "1.5"
 
 [lints.rust]
 unexpected_cfgs = "allow"
