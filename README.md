@@ -1,8 +1,6 @@
 # workspace
 
-A macOS CLI that captures your desktop window layout and puts it back, exactly.
-
-One Rust binary. No daemon, no GUI, no cloud, no AI. Deterministic commands, JSON on disk, real exit codes, scriptable output.
+A macOS CLI that captures your desktop window layout and puts it back, exactly. Written in Rust.
 
 ## Install
 
