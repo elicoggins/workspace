@@ -31,8 +31,7 @@ mod imp {
         fn CGDisplayModeRelease(mode: CGDisplayModeRef);
     }
 
-    /// Backing-pixel width ÷ point width. (`CGDisplayPixelsWide` returns
-    /// points on modern macOS, which made every display report ~1.0.)
+    // Use the display mode's backing pixel width; window frames are in points.
     fn display_scale_factor(id: CGDirectDisplayID, point_width: f64) -> f64 {
         if point_width <= 0.0 {
             return 1.0;

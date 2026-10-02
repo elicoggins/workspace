@@ -1,8 +1,4 @@
-//! Post-restore verification.
-//!
-//! Compares the desired state (a snapshot + per-window target frames) against
-//! a [`WorldState`] observation, and emits a per-window geometry delta plus
-//! summary metrics.  Pure logic so tests don't need real windows.
+//! Compare saved windows and target frames with current observations.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,7 +23,11 @@ pub struct VerifyReport {
     pub skipped: usize,
     pub mean_geometry_delta: f64,
     pub max_geometry_delta: f64,
+    /// Approximate geometry and visibility score, not the convergence criterion.
     pub accuracy: f32,
+    /// Every restorable window is visible and within two points of its target.
+    #[serde(default)]
+    pub converged: bool,
     pub windows: Vec<VerifyEntry>,
 }
 
@@ -42,7 +42,29 @@ pub struct VerifyEntry {
     pub match_score: Option<MatchScore>,
     pub expected_frame: Frame,
     pub observed_frame: Option<Frame>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_minimized: Option<bool>,
     pub geometry_delta: Option<f64>,
+}
+
+impl VerifyEntry {
+    /// A policy skip or a visible match within two points in each frame component.
+    pub fn is_satisfied(&self) -> bool {
+        if self.skipped_reason.is_some() {
+            return true;
+        }
+        if !self.matched || self.observed_minimized != Some(false) {
+            return false;
+        }
+        let Some(observed) = self.observed_frame else {
+            return false;
+        };
+        let expected = self.expected_frame;
+        (observed.x - expected.x).abs() <= 2.0
+            && (observed.y - expected.y).abs() <= 2.0
+            && (observed.width - expected.width).abs() <= 2.0
+            && (observed.height - expected.height).abs() <= 2.0
+    }
 }
 
 pub fn verify(
@@ -56,25 +78,23 @@ pub fn verify(
     let mut total_delta = 0.0;
     let mut max_delta: f64 = 0.0;
     let mut matched = 0;
+    let mut visible = 0;
     let mut skipped = 0;
 
-    // Windows restore never touches must not count against accuracy —
-    // otherwise any snapshot containing an unsupported app can never verify
-    // at 100% and `restore --converge` never stops early.
+    // Policy skips are excluded from accuracy, but still reserve their matches.
     let mut skip_reasons: Vec<Option<String>> = Vec::with_capacity(snapshot.windows.len());
     let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for (index, window) in snapshot.windows.iter().enumerate() {
         let reason = restore_skip_reason(window);
-        if reason.is_none() {
-            if let Some(bundle) = window.bundle_id.as_deref() {
-                groups.entry(bundle).or_default().push(index);
-            }
+        if let Some(bundle) = window.bundle_id.as_deref() {
+            // Reserve skipped counterparts just as planning does, without
+            // counting them toward the restoration metrics below.
+            groups.entry(bundle).or_default().push(index);
         }
         skip_reasons.push(reason);
     }
 
-    // Match with the planner's assigner (globally best pair first, distinct
-    // live windows) so verify reports exactly what the planner would reuse.
+    // Use the planner's assignments, including reservations for skipped windows.
     let consumed: HashSet<u32> = HashSet::new();
     let mut match_results: Vec<Option<(usize, MatchScore)>> = vec![None; snapshot.windows.len()];
     for (bundle, indices) in &groups {
@@ -82,6 +102,7 @@ pub fn verify(
             .iter()
             .map(|index| &snapshot.windows[*index])
             .collect();
+        let targets: Vec<_> = indices.iter().map(|index| target_frames[*index]).collect();
         let live_indices: Vec<usize> = world
             .windows
             .iter()
@@ -93,7 +114,7 @@ pub fn verify(
             .iter()
             .map(|live_index| &world.windows[*live_index])
             .collect();
-        for (local, assignment) in assign_matches(&saved_refs, &live_refs, &consumed)
+        for (local, assignment) in assign_matches(&saved_refs, &targets, &live_refs, &consumed)
             .into_iter()
             .enumerate()
         {
@@ -117,6 +138,7 @@ pub fn verify(
                 match_score: None,
                 expected_frame: expected,
                 observed_frame: None,
+                observed_minimized: None,
                 geometry_delta: None,
             });
             continue;
@@ -129,6 +151,10 @@ pub fn verify(
                 total_delta += delta;
                 max_delta = max_delta.max(delta);
                 matched += 1;
+                let minimized = world.windows[live_index].minimized;
+                if !minimized {
+                    visible += 1;
+                }
                 entries.push(VerifyEntry {
                     saved_window_index: index,
                     app_name: window.app_name.clone(),
@@ -138,6 +164,7 @@ pub fn verify(
                     match_score: Some(score),
                     expected_frame: expected,
                     observed_frame: Some(observed),
+                    observed_minimized: Some(minimized),
                     geometry_delta: Some(delta),
                 });
             }
@@ -150,6 +177,7 @@ pub fn verify(
                 match_score: None,
                 expected_frame: expected,
                 observed_frame: None,
+                observed_minimized: None,
                 geometry_delta: None,
             }),
         }
@@ -171,9 +199,11 @@ pub fn verify(
         } else {
             (1.0 - (mean_geometry_delta / 200.0).min(1.0)) as f32
         };
-        let match_ratio = matched as f32 / restorable as f32;
-        (match_ratio * geometry_quality).clamp(0.0, 1.0)
+        let visible_match_ratio = visible as f32 / restorable as f32;
+        (visible_match_ratio * geometry_quality).clamp(0.0, 1.0)
     };
+
+    let converged = entries.iter().all(VerifyEntry::is_satisfied);
 
     VerifyReport {
         snapshot: snapshot.name.clone(),
@@ -184,6 +214,7 @@ pub fn verify(
         mean_geometry_delta,
         max_geometry_delta: max_delta,
         accuracy,
+        converged,
         windows: entries,
     }
 }
@@ -282,6 +313,7 @@ mod tests {
         assert_eq!(report.unmatched, 0);
         assert!(report.accuracy > 0.99);
         assert!(report.mean_geometry_delta < 0.5);
+        assert!(report.converged);
     }
 
     #[test]
@@ -294,6 +326,7 @@ mod tests {
         assert_eq!(report.matched, 0);
         assert_eq!(report.unmatched, 1);
         assert!(report.accuracy < 0.01);
+        assert!(!report.converged);
     }
 
     #[test]
@@ -329,6 +362,78 @@ mod tests {
         );
         assert!(report.windows[1].skipped_reason.is_some());
         assert!(report.windows[2].skipped_reason.is_some());
+        assert!(report.converged);
+    }
+
+    #[test]
+    fn minimized_match_is_not_a_restored_window() {
+        let bundle = "com.apple.Terminal";
+        let expected = frame(0.0, 0.0);
+        let snap = snapshot(saved_window("main", bundle, expected));
+        let mut live = live_window("main", bundle, expected, 1);
+        live.minimized = true;
+        let report = verify(&snap, &world(vec![live]), &[expected]);
+
+        assert_eq!(report.matched, 1);
+        assert_eq!(report.windows[0].observed_minimized, Some(true));
+        assert!(report.accuracy < 1.0);
+        assert!(!report.converged);
+    }
+
+    #[test]
+    fn aggregate_accuracy_cannot_hide_one_displaced_window() {
+        let bundle = "com.apple.Terminal";
+        let expected = frame(0.0, 0.0);
+        let mut snap = snapshot(saved_window("window 0", bundle, expected));
+        snap.windows.extend(
+            (1..101).map(|index| saved_window(&format!("window {index}"), bundle, expected)),
+        );
+        let mut live: Vec<_> = snap
+            .windows
+            .iter()
+            .enumerate()
+            .map(|(index, saved)| {
+                live_window(
+                    saved.title.as_deref().unwrap(),
+                    bundle,
+                    expected,
+                    index as u32 + 1,
+                )
+            })
+            .collect();
+        live[100].frame.x += 40.0;
+        let report = verify(&snap, &world(live), &[expected; 101]);
+
+        assert_eq!(report.matched, 101);
+        assert!(report.accuracy >= 0.999);
+        assert!(!report.converged);
+        assert!(!report.windows[100].is_satisfied());
+    }
+
+    #[test]
+    fn convergence_checks_each_frame_component() {
+        let bundle = "com.apple.Terminal";
+        let expected = frame(0.0, 0.0);
+        let snap = snapshot(saved_window("main", bundle, expected));
+        for component in 0..4 {
+            for offset in [2.0, 3.0] {
+                let mut observed = expected;
+                match component {
+                    0 => observed.x += offset,
+                    1 => observed.y += offset,
+                    2 => observed.width += offset,
+                    _ => observed.height += offset,
+                }
+                let report = verify(
+                    &snap,
+                    &world(vec![live_window("main", bundle, observed, 1)]),
+                    &[expected],
+                );
+                assert_eq!(report.matched, 1);
+                assert!(report.mean_geometry_delta < 2.0);
+                assert_eq!(report.converged, offset == 2.0, "{report:?}");
+            }
+        }
     }
 
     #[test]

@@ -63,7 +63,7 @@ pub fn capture_workspace(name: &str) -> Result<WorkspaceSnapshot> {
     })
 }
 
-/// The `HOSTNAME` env var is rarely set by interactive shells; ask libc.
+// Shells do not consistently set HOSTNAME; prefer gethostname.
 fn hostname() -> String {
     #[cfg(unix)]
     {
@@ -93,9 +93,7 @@ fn dominant_display(frame: Frame, displays: &[DisplaySnapshot]) -> Option<&Displ
     })
 }
 
-/// The CG window list cannot see fullscreen status; enrich captured windows
-/// via AX so the planner's fullscreen skip-gate acts on real data. Best
-/// effort: without Accessibility permission this is a no-op.
+// CG does not report fullscreen state. Read it through AX when permitted.
 fn mark_fullscreen_windows(windows: &mut [WindowSnapshot]) {
     use crate::macos::accessibility;
 
@@ -137,8 +135,6 @@ fn frames_approx(a: Frame, b: Frame) -> bool {
 
 fn attach_chrome_tabs(windows: &mut [WindowSnapshot]) {
     for app in crate::app_support::tab_capable_apps() {
-        // Only shell out to osascript for browsers that actually have
-        // captured windows.
         if !windows
             .iter()
             .any(|window| window.bundle_id.as_deref() == Some(app.bundle_id))
@@ -172,9 +168,7 @@ fn assign_browser_tabs(
     let mut used = vec![false; chrome_windows.len()];
     let mut assigned = vec![false; snapshot_indices.len()];
 
-    // Pass 1: assign by title, but only on a real match. A zero score means
-    // "no evidence" — falling back to an arbitrary window here would attach
-    // the wrong tab set whenever titles differ between CG and AppleScript.
+    // Prefer title matches before falling back to list order.
     for (slot, &window_index) in snapshot_indices.iter().enumerate() {
         let window = &windows[window_index];
         let matched_index = chrome_windows
@@ -198,9 +192,8 @@ fn assign_browser_tabs(
         }
     }
 
-    // Pass 2: pair remaining windows in front-to-back order. Both the CG
-    // window list (snapshot order) and Chrome's AppleScript window list are
-    // ordered front-to-back, so positional pairing is the best fallback.
+    // This fallback assumes the lists contain the same windows. Minimized
+    // browser windows can break that assumption.
     let mut remaining = (0..chrome_windows.len()).filter(|index| !used[*index]);
     for (slot, &window_index) in snapshot_indices.iter().enumerate() {
         if assigned[slot] {
@@ -290,9 +283,6 @@ mod tests {
 
     #[test]
     fn chrome_tabs_fall_back_to_front_to_back_order_when_titles_are_missing() {
-        // No CG titles at all (e.g. Screen Recording permission missing) —
-        // tabs must still land on distinct windows in z-order, not on
-        // whichever window an arbitrary max-by-key tie-break picked.
         let mut windows = vec![chrome_snapshot_window(None), chrome_snapshot_window(None)];
         let chrome_windows = vec![
             ChromeWindowTabs {
@@ -324,8 +314,6 @@ mod tests {
 
         assign_browser_tabs(&mut windows, "com.google.Chrome", &chrome_windows);
 
-        // The titled match wins; the unrelated window gets nothing rather
-        // than stealing the only tab set.
         assert!(windows[0].browser_tabs.is_empty());
         assert_eq!(windows[1].browser_tabs[0].url, "https://example.com/docs");
     }

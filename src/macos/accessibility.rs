@@ -3,8 +3,7 @@ use crate::{
     model::{Frame, WindowSnapshot},
 };
 
-/// AX-visible state of one window, including the flags the CG window list
-/// cannot report.
+/// Window state read through Accessibility.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AxWindowState {
     pub title: Option<String>,
@@ -13,9 +12,53 @@ pub struct AxWindowState {
     pub fullscreen: bool,
 }
 
+// Resolve against the selected live observation. Ambiguous matches are rejected.
+#[cfg(any(target_os = "macos", test))]
+fn observed_window_index(observed: &WindowSnapshot, states: &[AxWindowState]) -> Option<usize> {
+    if observed.frame.width <= 0.0 || observed.frame.height <= 0.0 {
+        return None;
+    }
+    let mut matches = states.iter().enumerate().filter(|(_, state)| {
+        !state.fullscreen
+            && state.minimized == observed.minimized
+            && state
+                .frame
+                .is_some_and(|frame| frames_close(frame, observed.frame))
+            && observed
+                .title
+                .as_ref()
+                .is_none_or(|title| state.title.as_ref() == Some(title))
+    });
+    let first = matches.next()?.0;
+    matches.next().is_none().then_some(first)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn observed_window_indices(
+    observed: &[WindowSnapshot],
+    states: &[AxWindowState],
+) -> Vec<Option<usize>> {
+    let indices: Vec<_> = observed
+        .iter()
+        .map(|window| observed_window_index(window, states))
+        .collect();
+    indices
+        .iter()
+        .map(|index| index.filter(|_| indices.iter().filter(|other| *other == index).count() == 1))
+        .collect()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn frames_close(left: Frame, right: Frame) -> bool {
+    (left.x - right.x).abs() <= 2.0
+        && (left.y - right.y).abs() <= 2.0
+        && (left.width - right.width).abs() <= 2.0
+        && (left.height - right.height).abs() <= 2.0
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
-    use core_foundation::base::{CFRelease, CFTypeRef};
+    use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
     use libc::{c_char, c_void, pid_t};
     use objc::{msg_send, runtime::Object, sel, sel_impl};
 
@@ -97,28 +140,147 @@ mod imp {
         unsafe { AXIsProcessTrusted() }
     }
 
-    pub fn set_window_frame(pid: i32, saved: &WindowSnapshot, target: Frame) -> Result<bool> {
-        tracing::debug!(pid, app = %saved.app_name, "creating AX application element");
-        let application = unsafe { AXUIElementCreateApplication(pid) };
-        if application.is_null() {
-            return Ok(false);
+    /// Owns an AX window reference; cloning retains it and dropping releases it.
+    pub struct WindowHandle(AXUIElementRef);
+
+    impl Clone for WindowHandle {
+        fn clone(&self) -> Self {
+            unsafe { CFRetain(self.0 as CFTypeRef) };
+            Self(self.0)
+        }
+    }
+
+    impl Drop for WindowHandle {
+        fn drop(&mut self) {
+            unsafe { CFRelease(self.0 as CFTypeRef) };
+        }
+    }
+
+    impl WindowHandle {
+        pub fn same_window(&self, other: &Self) -> bool {
+            unsafe { CFEqual(self.0 as CFTypeRef, other.0 as CFTypeRef) != 0 }
         }
 
-        let result = set_window_frame_for_application(application, saved, target);
+        pub fn set_frame(&self, target: Frame) -> Result<bool> {
+            if self.is_fullscreen() {
+                return Ok(false);
+            }
+            set_and_verify(self.0, target)
+        }
+
+        pub fn raise(&self) -> Result<bool> {
+            if self.is_fullscreen() {
+                return Ok(false);
+            }
+            perform_action(self.0, "AXRaise")
+        }
+
+        pub fn is_fullscreen(&self) -> bool {
+            copy_bool_attribute(self.0, "AXFullScreen") == Some(true)
+        }
+
+        pub fn set_minimized(&self, minimized: bool) -> Result<bool> {
+            if self.is_fullscreen() {
+                return Ok(false);
+            }
+            let key = cf_string("AXMinimized");
+            let error =
+                unsafe { AXUIElementSetAttributeValue(self.0, key, k_cf_boolean(minimized)) };
+            unsafe { CFRelease(key as CFTypeRef) };
+            if error != K_AX_ERROR_SUCCESS {
+                return Err(WorkspaceError::MacOs(format!(
+                    "AXUIElementSetAttributeValue(AXMinimized) returned {error}"
+                )));
+            }
+            Ok(copy_bool_attribute(self.0, "AXMinimized") == Some(minimized))
+        }
+
+        pub fn close(&self) -> Result<bool> {
+            if self.is_fullscreen() {
+                return Ok(false);
+            }
+            let key = cf_string("AXCloseButton");
+            let mut button: CFTypeRef = std::ptr::null();
+            let error = unsafe { AXUIElementCopyAttributeValue(self.0, key, &mut button) };
+            unsafe { CFRelease(key as CFTypeRef) };
+            if error != K_AX_ERROR_SUCCESS || button.is_null() {
+                return Ok(false);
+            }
+            let result = perform_action(button as AXUIElementRef, "AXPress");
+            // Release the copied button even when AXPress fails.
+            unsafe { CFRelease(button) };
+            result
+        }
+    }
+
+    pub fn resolve_window(pid: i32, observed: &WindowSnapshot) -> Result<Option<WindowHandle>> {
+        let application = unsafe { AXUIElementCreateApplication(pid) };
+        if application.is_null() {
+            return Ok(None);
+        }
+        let result = with_matching_window(application, observed, |window| {
+            unsafe { CFRetain(window as CFTypeRef) };
+            Ok(WindowHandle(window))
+        });
         unsafe { CFRelease(application as CFTypeRef) };
         result
     }
 
-    pub fn raise_window(pid: i32, saved: &WindowSnapshot) -> Result<bool> {
-        tracing::debug!(pid, app = %saved.app_name, "creating AX application element for raise");
+    pub fn resolve_windows(
+        pid: i32,
+        observed: &[WindowSnapshot],
+    ) -> Result<Vec<Option<WindowHandle>>> {
         let application = unsafe { AXUIElementCreateApplication(pid) };
         if application.is_null() {
-            return Ok(false);
+            return Ok(observed.iter().map(|_| None).collect());
         }
-
-        let result = raise_window_for_application(application, saved);
+        let result = with_windows(application, |windows, states| {
+            Ok(observed_window_indices(observed, states)
+                .into_iter()
+                .map(|index| {
+                    index.map(|index| {
+                        unsafe { CFRetain(windows[index] as CFTypeRef) };
+                        WindowHandle(windows[index])
+                    })
+                })
+                .collect())
+        });
         unsafe { CFRelease(application as CFTypeRef) };
         result
+    }
+
+    /// Retain all AX windows, including ambiguous ones, to identify windows
+    /// that predate a creation operation while AX catches up to CG.
+    pub fn window_handles(pid: i32) -> Result<Vec<WindowHandle>> {
+        let application = unsafe { AXUIElementCreateApplication(pid) };
+        if application.is_null() {
+            return Ok(Vec::new());
+        }
+        let result = with_windows(application, |windows, _| {
+            Ok(windows
+                .iter()
+                .map(|window| {
+                    unsafe { CFRetain(*window as CFTypeRef) };
+                    WindowHandle(*window)
+                })
+                .collect())
+        });
+        unsafe { CFRelease(application as CFTypeRef) };
+        result
+    }
+
+    pub fn set_window_frame(pid: i32, saved: &WindowSnapshot, target: Frame) -> Result<bool> {
+        match resolve_window(pid, saved)? {
+            Some(handle) => handle.set_frame(target),
+            None => Ok(false),
+        }
+    }
+
+    pub fn raise_window(pid: i32, saved: &WindowSnapshot) -> Result<bool> {
+        match resolve_window(pid, saved)? {
+            Some(handle) => handle.raise(),
+            None => Ok(false),
+        }
     }
 
     pub fn minimize_window(pid: i32, saved: &WindowSnapshot) -> Result<bool> {
@@ -130,31 +292,13 @@ mod imp {
     }
 
     fn set_window_minimized(pid: i32, saved: &WindowSnapshot, minimized: bool) -> Result<bool> {
-        let application = unsafe { AXUIElementCreateApplication(pid) };
-        if application.is_null() {
-            return Ok(false);
+        match resolve_window(pid, saved)? {
+            Some(handle) => handle.set_minimized(minimized),
+            None => Ok(false),
         }
-        let result = with_matching_window(application, saved, |window| {
-            let key = cf_string("AXMinimized");
-            let value: CFTypeRef = unsafe { k_cf_boolean(minimized) };
-            let error = unsafe { AXUIElementSetAttributeValue(window, key, value) };
-            unsafe { CFRelease(key as CFTypeRef) };
-            if error == K_AX_ERROR_SUCCESS {
-                Ok(true)
-            } else {
-                Err(WorkspaceError::MacOs(format!(
-                    "AXUIElementSetAttributeValue(AXMinimized) returned {error}"
-                )))
-            }
-        })
-        .map(|matched| matched.unwrap_or(false));
-        unsafe { CFRelease(application as CFTypeRef) };
-        result
     }
 
-    /// Per-window AX state for one process: title, frame, and the two flags
-    /// the CG window list cannot see (minimized windows are absent from it
-    /// entirely; fullscreen status is invisible).
+    /// Read titles, frames, and visibility flags for one process's AX windows.
     pub fn ax_window_states(pid: i32) -> Result<Vec<AxWindowState>> {
         let application = unsafe { AXUIElementCreateApplication(pid) };
         if application.is_null() {
@@ -194,45 +338,10 @@ mod imp {
     }
 
     pub fn close_window(pid: i32, saved: &WindowSnapshot) -> Result<bool> {
-        let application = unsafe { AXUIElementCreateApplication(pid) };
-        if application.is_null() {
-            return Ok(false);
+        match resolve_window(pid, saved)? {
+            Some(handle) => handle.close(),
+            None => Ok(false),
         }
-        let result = with_matching_window(application, saved, |window| {
-            // Find AXCloseButton subelement and perform AXPress.
-            let key = cf_string("AXCloseButton");
-            let mut button: CFTypeRef = std::ptr::null();
-            let error = unsafe { AXUIElementCopyAttributeValue(window, key, &mut button) };
-            unsafe { CFRelease(key as CFTypeRef) };
-            if error != K_AX_ERROR_SUCCESS || button.is_null() {
-                return Ok(false);
-            }
-            let pressed = perform_action(button as AXUIElementRef, "AXPress")?;
-            unsafe { CFRelease(button) };
-            Ok(pressed)
-        })
-        .map(|matched| matched.unwrap_or(false));
-        unsafe { CFRelease(application as CFTypeRef) };
-        result
-    }
-
-    fn set_window_frame_for_application(
-        application: AXUIElementRef,
-        saved: &WindowSnapshot,
-        target: Frame,
-    ) -> Result<bool> {
-        with_matching_window(application, saved, |window| set_and_verify(window, target))
-            .map(|matched| matched.unwrap_or(false))
-    }
-
-    fn raise_window_for_application(
-        application: AXUIElementRef,
-        saved: &WindowSnapshot,
-    ) -> Result<bool> {
-        with_matching_window(application, saved, |window| {
-            perform_action(window, "AXRaise")
-        })
-        .map(|matched| matched.unwrap_or(false))
     }
 
     fn with_matching_window<T>(
@@ -240,46 +349,56 @@ mod imp {
         saved: &WindowSnapshot,
         operation: impl FnOnce(AXUIElementRef) -> Result<T>,
     ) -> Result<Option<T>> {
+        with_windows(application, |windows, states| {
+            match observed_window_index(saved, states) {
+                Some(index) => operation(windows[index]).map(Some),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn with_windows<T>(
+        application: AXUIElementRef,
+        operation: impl FnOnce(&[AXUIElementRef], &[AxWindowState]) -> Result<T>,
+    ) -> Result<T> {
         let windows_key = cf_string("AXWindows");
         let mut windows_value: CFTypeRef = std::ptr::null();
-        tracing::debug!(app = %saved.app_name, "copying AX windows attribute");
+        tracing::debug!("copying AX windows attribute");
         let error =
             unsafe { AXUIElementCopyAttributeValue(application, windows_key, &mut windows_value) };
         unsafe { CFRelease(windows_key as CFTypeRef) };
 
         if error != K_AX_ERROR_SUCCESS || windows_value.is_null() {
-            return Ok(None);
+            return Err(WorkspaceError::MacOs(format!(
+                "could not observe AXWindows (error {error})"
+            )));
         }
 
-        let mut best_window = std::ptr::null();
-        let mut best_score = i32::MIN;
+        let mut windows = Vec::new();
+        let mut states = Vec::new();
 
         unsafe {
             let array = windows_value as *mut Object;
-            tracing::debug!(app = %saved.app_name, "reading AX window array count");
+            tracing::debug!("reading AX window array count");
             let count: usize = msg_send![array, count];
-            tracing::debug!(app = %saved.app_name, count, "matching AX windows");
+            tracing::debug!(count, "matching AX windows");
             for index in 0..count {
-                tracing::debug!(app = %saved.app_name, index, "reading AX window from array");
+                tracing::debug!(index, "reading AX window from array");
                 let window: AXUIElementRef = msg_send![array, objectAtIndex: index];
                 if window.is_null() {
                     continue;
                 }
-                let title = copy_string_attribute(window, "AXTitle");
-                let frame = read_frame(window).unwrap_or(saved.frame);
-                let score = score_window(saved, title.as_deref(), frame);
-                if score > best_score {
-                    best_score = score;
-                    best_window = window;
-                }
+                windows.push(window);
+                states.push(AxWindowState {
+                    title: copy_string_attribute(window, "AXTitle"),
+                    frame: read_frame(window),
+                    minimized: copy_bool_attribute(window, "AXMinimized").unwrap_or(false),
+                    fullscreen: copy_bool_attribute(window, "AXFullScreen").unwrap_or(false),
+                });
             }
         }
 
-        let result = if best_window.is_null() {
-            Ok(None)
-        } else {
-            operation(best_window).map(Some)
-        };
+        let result = operation(&windows, &states);
 
         unsafe { CFRelease(windows_value) };
         result
@@ -300,7 +419,7 @@ mod imp {
         set_position(window, target)?;
         Ok(read_frame(window)
             .map(|frame| frames_close(frame, target))
-            .unwrap_or(true))
+            .unwrap_or(false))
     }
 
     fn set_position(window: AXUIElementRef, frame: Frame) -> Result<()> {
@@ -448,40 +567,6 @@ mod imp {
         string
     }
 
-    fn score_window(saved: &WindowSnapshot, title: Option<&str>, frame: Frame) -> i32 {
-        score_match(saved.title.as_deref(), saved.frame, title, frame)
-    }
-
-    fn score_match(
-        saved_title: Option<&str>,
-        saved_frame: Frame,
-        candidate_title: Option<&str>,
-        candidate_frame: Frame,
-    ) -> i32 {
-        let mut score = 0;
-        if let (Some(saved_title), Some(candidate_title)) = (saved_title, candidate_title) {
-            if saved_title == candidate_title {
-                score += 1000;
-            } else if candidate_title.contains(saved_title) || saved_title.contains(candidate_title)
-            {
-                score += 250;
-            }
-        }
-
-        let distance = (saved_frame.x - candidate_frame.x).abs()
-            + (saved_frame.y - candidate_frame.y).abs()
-            + (saved_frame.width - candidate_frame.width).abs()
-            + (saved_frame.height - candidate_frame.height).abs();
-        score - distance.min(5000.0) as i32
-    }
-
-    fn frames_close(left: Frame, right: Frame) -> bool {
-        (left.x - right.x).abs() <= 2.0
-            && (left.y - right.y).abs() <= 2.0
-            && (left.width - right.width).abs() <= 2.0
-            && (left.height - right.height).abs() <= 2.0
-    }
-
     fn cf_string(value: &str) -> CFStringRef {
         let c_string = std::ffi::CString::new(value).expect("CFString contained an interior null");
         unsafe {
@@ -535,3 +620,125 @@ pub use imp::{
     ax_window_states, close_window, ensure_trusted, is_trusted, minimize_window, raise_window,
     set_window_frame, unminimize_window,
 };
+
+#[cfg(target_os = "macos")]
+pub use imp::{resolve_window, resolve_windows, window_handles, WindowHandle};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn observed(title: Option<&str>, x: f64) -> WindowSnapshot {
+        WindowSnapshot {
+            window_id: 1,
+            app_name: "Terminal".into(),
+            process_name: "Terminal".into(),
+            bundle_id: Some("com.apple.Terminal".into()),
+            pid: 1,
+            title: title.map(str::to_owned),
+            frame: Frame {
+                x,
+                y: 0.0,
+                width: 800.0,
+                height: 600.0,
+            },
+            display_id: None,
+            display_frame: None,
+            display_relative_frame: None,
+            z_order: None,
+            fullscreen: false,
+            minimized: false,
+            enabled: true,
+            browser_tabs: vec![],
+        }
+    }
+
+    fn state(window: &WindowSnapshot) -> AxWindowState {
+        AxWindowState {
+            title: window.title.clone(),
+            frame: Some(window.frame),
+            minimized: window.minimized,
+            fullscreen: window.fullscreen,
+        }
+    }
+
+    #[test]
+    fn identity_follows_the_planned_live_observation() {
+        let historical = observed(Some("wanted"), 0.0);
+        let live = observed(Some("wanted"), 5000.0);
+        let other = observed(Some("unrelated"), historical.frame.x);
+        let states = vec![state(&other), state(&live)];
+        assert_eq!(observed_window_index(&live, &states), Some(1));
+        // If that window disappears, the old coordinates do not pick a replacement.
+        assert_eq!(observed_window_index(&live, &states[..1]), None);
+    }
+
+    #[test]
+    fn missing_frames_and_contradictory_titles_are_rejected() {
+        let live = observed(Some("wanted"), 0.0);
+        let mut unreadable = state(&live);
+        unreadable.frame = None;
+        let different = state(&observed(Some("unrelated"), 0.0));
+        assert_eq!(observed_window_index(&live, &[unreadable, different]), None);
+    }
+
+    #[test]
+    fn overlapping_windows_require_unique_evidence() {
+        let first = observed(Some("first"), 0.0);
+        let second = observed(Some("second"), 0.0);
+        let states = vec![state(&first), state(&second)];
+        assert_eq!(observed_window_index(&first, &states), Some(0));
+        assert_eq!(observed_window_index(&second, &states), Some(1));
+        assert_eq!(observed_window_index(&observed(None, 0.0), &states), None);
+        assert_eq!(
+            observed_window_index(&first, &[state(&first), state(&first)]),
+            None
+        );
+    }
+
+    #[test]
+    fn two_observations_cannot_bind_the_same_ax_window() {
+        let first = observed(Some("window"), 0.0);
+        let nearby = observed(Some("window"), 1.0);
+        assert_eq!(
+            observed_window_indices(&[first.clone(), nearby], &[state(&first)]),
+            vec![None, None]
+        );
+        let separate = observed(Some("window"), 1000.0);
+        assert_eq!(
+            observed_window_indices(
+                &[first.clone(), separate.clone()],
+                &[state(&first), state(&separate)]
+            ),
+            vec![Some(0), Some(1)]
+        );
+    }
+
+    #[test]
+    fn identity_checks_visibility_and_fullscreen_state() {
+        let mut live = observed(Some("window"), 0.0);
+        live.minimized = true;
+        let mut candidate = state(&live);
+        candidate.minimized = false;
+        assert_eq!(observed_window_index(&live, &[candidate]), None);
+        assert_eq!(observed_window_index(&live, &[state(&live)]), Some(0));
+        let mut fullscreen = state(&live);
+        fullscreen.fullscreen = true;
+        assert_eq!(observed_window_index(&live, &[fullscreen]), None);
+    }
+
+    #[test]
+    fn identity_requires_valid_geometry_within_tolerance() {
+        let live = observed(None, 0.0);
+        let mut near = state(&live);
+        near.frame.as_mut().unwrap().x += 1.9;
+        assert_eq!(observed_window_index(&live, &[near.clone()]), Some(0));
+        near.frame.as_mut().unwrap().width += 3.0;
+        assert_eq!(observed_window_index(&live, &[near]), None);
+        let mut invalid = live.clone();
+        invalid.frame.width = 0.0;
+        assert_eq!(observed_window_index(&invalid, &[state(&invalid)]), None);
+        invalid.frame.width = f64::NAN;
+        assert_eq!(observed_window_index(&invalid, &[state(&invalid)]), None);
+    }
+}

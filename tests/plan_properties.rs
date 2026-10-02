@@ -1,12 +1,4 @@
-//! Property-based tests for the deterministic planner.
-//!
-//! Invariants verified:
-//! 1. Safe mode never emits Close or Minimize operations.
-//! 2. Idempotency: planning twice on identical inputs yields identical plans.
-//! 3. Convergence: SimulatedExecutor + planner reach 100% match in ≤ 2
-//!    iterations for non-pathological worlds.
-//! 4. Window-count conservation: a plan that contains only Reposition ops
-//!    leaves the live-world window count unchanged after execution.
+//! Planner properties for small, titled workspaces on one display.
 
 use chrono::{TimeZone, Utc};
 use proptest::prelude::*;
@@ -69,7 +61,6 @@ fn snapshot_of(windows: Vec<WindowSnapshot>) -> WorkspaceSnapshot {
     }
 }
 
-/// Strategy: build a small saved workspace (1..=4 windows of supported apps).
 fn arb_saved() -> impl Strategy<Value = WorkspaceSnapshot> {
     let bundles = [
         ("com.apple.Terminal", "Terminal"),
@@ -112,7 +103,6 @@ proptest! {
         cases: 64, .. ProptestConfig::default()
     })]
 
-    /// Safe mode must never emit destructive ops.
     #[test]
     fn safe_mode_never_destructive(snap in arb_saved()) {
         let world = WorldState::default();
@@ -132,9 +122,8 @@ proptest! {
         }
     }
 
-    /// Planning is deterministic: two plans over identical inputs are equal.
     #[test]
-    fn planner_is_idempotent(snap in arb_saved()) {
+    fn same_input_produces_same_plan(snap in arb_saved()) {
         let world = WorldState::default();
         let frames = target_frames(&snap);
         let opts = PlanOptions { mode: RestoreMode::Safe, dev_mode: false };
@@ -143,10 +132,8 @@ proptest! {
         prop_assert_eq!(a, b);
     }
 
-    /// Convergence: applying plan+execute against a simulated empty world
-    /// reaches verify-equivalence (target frame match) within 2 iterations.
     #[test]
-    fn simulated_convergence_is_fast(snap in arb_saved()) {
+    fn empty_world_reaches_saved_positions_within_three_passes(snap in arb_saved()) {
         let frames = target_frames(&snap);
         let opts = PlanOptions { mode: RestoreMode::Safe, dev_mode: false };
         let mut world = WorldState::default();
@@ -171,12 +158,8 @@ proptest! {
         prop_assert!(false, "did not converge within 3 iterations");
     }
 
-    /// Window-count conservation: a Reposition-only plan does not change the
-    /// total number of live windows.
     #[test]
     fn reposition_only_conserves_window_count(snap in arb_saved()) {
-        // Seed world with exactly one matching live window per saved window
-        // so the planner only chooses Reposition ops.
         let mut world = WorldState::default();
         for (i, saved) in snap.windows.iter().enumerate() {
             world.windows.push(LiveWindow {
@@ -209,7 +192,6 @@ proptest! {
             PlanOptions { mode: RestoreMode::Safe, dev_mode: false },
             &frames,
         );
-        // Verify the plan only contains Reposition or Skip ops.
         for op in &plan.operations {
             let ok = matches!(
                 op.kind,

@@ -1,10 +1,11 @@
 use std::process::ExitCode;
 
+use clap::Parser;
 use tracing_subscriber::EnvFilter;
 use workspace::{cli::Cli, run};
 
 fn main() -> ExitCode {
-    let cli = Cli::parse_args();
+    let cli = Cli::parse();
 
     let filter = if cli.verbose {
         EnvFilter::new("workspace=debug")
@@ -16,6 +17,7 @@ fn main() -> ExitCode {
         .with_env_filter(filter)
         .without_time()
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
 
     match run(cli) {
@@ -24,7 +26,6 @@ fn main() -> ExitCode {
             use workspace::error::WorkspaceError;
             use workspace::style;
             eprintln!("{} {error}", style::red("error:"));
-            // Helpful follow-up hints for common failures.
             match &error {
                 WorkspaceError::NotFound(_) => {
                     eprintln!("       try: workspace list");

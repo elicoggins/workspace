@@ -9,6 +9,19 @@ pub struct ChromeWindowTabs {
     pub tabs: Vec<BrowserTab>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct RestoredBrowserWindow {
+    pub id: i64,
+    pub title: Option<String>,
+    pub frame: Frame,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct BrowserRestoreResult {
+    pub windows: Vec<Option<RestoredBrowserWindow>>,
+    pub errors: Vec<String>,
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use std::process::{Command, Stdio};
@@ -71,35 +84,21 @@ function run(argv) {
         parse_chrome_windows_json(&String::from_utf8_lossy(&output.stdout)).unwrap_or_default()
     }
 
-    /// One window per spec entry. The script NEVER rewrites tabs of an
-    /// existing non-blank window: for each entry it reuses an unused blank
-    /// new-tab window (e.g. the one Chrome opens on a cold launch) or creates
-    /// a fresh window, fills its tabs, and sets its bounds. Windows the
-    /// planner matched live are handled by `Reposition` ops and stay intact.
+    /// Create a fresh window per entry. Existing windows, including blank
+    /// windows already matched by the planner, are never adopted.
     const RESTORE_SCRIPT: &str = r#"
 function run(argv) {
   const chrome = Application(argv[0]);
   const specs = JSON.parse(argv[1]);
   chrome.activate();
-  const used = [];
+  const restored = specs.map(function () { return null; });
   const errors = [];
-  const isBlank = function (w) {
-    try {
-      if (w.tabs().length !== 1) return false;
-      const url = w.activeTab.url() || '';
-      return url === '' || url === 'about:blank' || /^[a-z-]+:\/\/newtab/.test(url);
-    } catch (e) {
-      return false;
-    }
-  };
   const windowIds = function () {
     return chrome.windows().map(function (w) {
-      try { return w.id(); } catch (e) { return null; }
+      return w.id();
     });
   };
-  // A freshly created window's initial tab materializes asynchronously;
-  // when Chrome is busy (e.g. it just processed an AX reposition) indexing
-  // tabs[0] immediately throws "Wrong index". Poll until the tab exists.
+  // New windows can appear before their first tab; indexing early throws "Wrong index".
   const waitForFirstTab = function (w) {
     for (let i = 0; i < 40; i++) {
       try { if (w.tabs().length > 0) return true; } catch (e) {}
@@ -110,127 +109,136 @@ function run(argv) {
   specs.forEach(function (spec, specIndex) {
     try {
       let target = null;
-      const wins = chrome.windows();
-      for (let i = 0; i < wins.length; i++) {
-        let id;
-        try { id = wins[i].id(); } catch (e) { continue; }
-        if (used.indexOf(id) !== -1) continue;
-        if (isBlank(wins[i])) { target = wins[i]; used.push(id); break; }
+      const before = windowIds();
+      // A creation response can fail after the window materializes. Resolve
+      // exactly one new ID; concurrent new windows make ownership ambiguous.
+      try { chrome.windows.push(chrome.Window()); } catch (e) {}
+      for (let attempt = 0; attempt < 40 && !target; attempt++) {
+        const added = windowIds().filter(function (id) { return before.indexOf(id) === -1; });
+        if (added.length > 1) throw new Error('multiple new windows; ownership is ambiguous');
+        if (added.length === 1) target = chrome.windows.byId(added[0]);
+        if (!target) delay(0.05);
       }
-      if (!target) {
-        // The object handed to push() does not track the created window;
-        // re-acquire it by diffing window ids before and after.
-        const before = windowIds();
-        // push() can throw "Wrong index" while Chrome is busy (e.g. right
-        // after an AX reposition) even though the window IS created — ignore
-        // the throw and locate the new window by id-diff below.
-        try { chrome.windows.push(chrome.Window()); } catch (e) {}
-        for (let attempt = 0; attempt < 40 && !target; attempt++) {
-          const after = chrome.windows();
-          for (let i = 0; i < after.length; i++) {
-            let id;
-            try { id = after[i].id(); } catch (e) { continue; }
-            if (before.indexOf(id) === -1) { target = after[i]; used.push(id); break; }
-          }
-          if (!target) delay(0.05);
-        }
-        if (!target) throw new Error('created a window but could not find it');
-      }
+      if (!target) throw new Error('created a window but could not find it');
+      if (!waitForFirstTab(target)) throw new Error('window has no tabs after waiting');
+      const initial = target.tabs().map(function (tab) { return tab.url() || ''; });
+      if (initial.length !== 1 || !(initial[0] === '' || initial[0] === 'about:blank' ||
+          /^[a-z-]+:\/\/newtab/.test(initial[0]))) throw new Error('new window was not blank');
       if (spec.urls.length > 0) {
-        if (!waitForFirstTab(target)) throw new Error('window has no tabs after waiting');
         target.tabs[0].url = spec.urls[0];
         for (let i = 1; i < spec.urls.length; i++) {
           target.tabs.push(chrome.Tab({ url: spec.urls[i] }));
         }
-        try { target.activeTabIndex = spec.active; } catch (e) {}
+        target.activeTabIndex = spec.active;
+        const actual = target.tabs().map(function (tab) { return tab.url() || ''; });
+        if (actual.length !== spec.urls.length || actual.some(function (url, i) { return url !== spec.urls[i]; }))
+          throw new Error('restored tabs could not be verified');
+        if (target.activeTabIndex() !== spec.active) throw new Error('active tab could not be verified');
       }
       target.bounds = { x: spec.x, y: spec.y, width: spec.width, height: spec.height };
+      const frame = target.bounds();
+      if (!(Math.abs(frame.x - spec.x) <= 2 && Math.abs(frame.y - spec.y) <= 2 &&
+            Math.abs(frame.width - spec.width) <= 2 && Math.abs(frame.height - spec.height) <= 2))
+        throw new Error('restored bounds could not be verified');
+      restored[specIndex] = { id: target.id(), title: target.name(), frame: frame };
     } catch (e) {
       errors.push('window ' + specIndex + ': ' + e);
     }
   });
-  return errors.join('; ');
+  return JSON.stringify({ windows: restored, errors: errors });
 }
 "#;
 
-    /// Re-open saved tabs that are missing from an already-matched live
-    /// window. Safe by construction: only ADDS tabs (by URL), never closes
-    /// or reorders anything the user has open. The window is located by its
-    /// bounds — the executor has just AX-moved it to `target`.
+    /// Reopen missing URLs in the selected window, preserving existing tabs.
     const RECONCILE_SCRIPT: &str = r#"
 function run(argv) {
   const chrome = Application(argv[0]);
   const spec = JSON.parse(argv[1]);
   if (!chrome.running()) return 'error: browser not running';
-  const wins = chrome.windows();
-  let best = null, bestDist = Infinity;
-  for (let i = 0; i < wins.length; i++) {
-    let b;
-    try { b = wins[i].bounds(); } catch (e) { continue; }
-    const d = Math.abs(b.x - spec.x) + Math.abs(b.y - spec.y) +
-              Math.abs(b.width - spec.width) + Math.abs(b.height - spec.height);
-    if (d < bestDist) { bestDist = d; best = wins[i]; }
-  }
-  if (!best || bestDist > 40) return 'error: no window near target bounds (dist ' + bestDist + ')';
-  const existing = best.tabs().map(function (t) {
-    try { return t.url() || ''; } catch (e) { return ''; }
-  });
-  // Identity guard: if the window shares NO saved tab and is not a blank
-  // new-tab window, the geometry match picked a different window (likely
-  // because the saved one was closed). Grafting saved tabs onto it would
-  // pollute an unrelated window — skip instead.
-  const isBlankWindow = existing.length === 1 &&
-    (existing[0] === '' || existing[0] === 'about:blank' || /^[a-z-]+:\/\/newtab/.test(existing[0]));
-  const overlap = existing.filter(function (u) { return spec.urls.indexOf(u) !== -1; }).length;
-  if (!isBlankWindow && overlap === 0) return 'error: matched window shares no saved tabs; not reconciling';
-  let added = 0;
-  for (let i = 0; i < spec.urls.length; i++) {
-    if (existing.indexOf(spec.urls[i]) === -1) {
-      try { best.tabs.push(chrome.Tab({ url: spec.urls[i] })); added++; } catch (e) {}
+  if (!Number.isSafeInteger(spec.windowId)) return 'error: missing window identity';
+  try {
+    const target = chrome.windows.byId(spec.windowId);
+    if (target.id() !== spec.windowId) return 'error: window identity changed';
+    const existing = target.tabs().map(function (t) { return t.url() || ''; });
+    // Reject unrelated content: the initial saved-to-live match is heuristic.
+    const isBlankWindow = existing.length === 1 &&
+      (existing[0] === '' || existing[0] === 'about:blank' || /^[a-z-]+:\/\/newtab/.test(existing[0]));
+    const overlap = existing.filter(function (u) { return spec.urls.indexOf(u) !== -1; }).length;
+    if (!isBlankWindow && overlap === 0) return 'error: matched window shares no saved tabs; not reconciling';
+    let added = 0;
+    for (let i = 0; i < spec.urls.length; i++) {
+      if (existing.indexOf(spec.urls[i]) === -1) {
+        target.tabs.push(chrome.Tab({ url: spec.urls[i] }));
+        existing.push(spec.urls[i]);
+        added++;
+      }
     }
-  }
-  if (spec.activeUrl) {
-    const now = best.tabs().map(function (t) {
-      try { return t.url() || ''; } catch (e) { return ''; }
-    });
-    const idx = now.indexOf(spec.activeUrl);
-    if (idx !== -1) { try { best.activeTabIndex = idx + 1; } catch (e) {} }
-  }
-  return 'added ' + added;
+    const now = target.tabs().map(function (t) { return t.url() || ''; });
+    if (spec.urls.some(function (url) { return now.indexOf(url) === -1; }))
+      return 'error: restored tabs could not be verified';
+    if (spec.activeUrl) {
+      const idx = now.indexOf(spec.activeUrl);
+      if (idx === -1) return 'error: saved active tab is missing';
+      target.activeTabIndex = idx + 1;
+      if (target.activeTabIndex() !== idx + 1) return 'error: active tab could not be verified';
+    }
+    return 'added ' + added;
+  } catch (e) { return 'error: ' + e; }
 }
 "#;
 
-    /// Move a browser window by scripting `bounds`. Chromium's AX
-    /// implementation intermittently rejects `AXSize` writes
-    /// (kAXErrorFailure -25200); the scripting dictionary is deterministic.
-    /// The window is located by its current frame.
+    /// Bridge one live observation to a scripting ID before any mutations.
+    /// Titles are optional; bounds must agree and the match must be unique.
+    const RESOLVE_WINDOW_SCRIPT: &str = r#"
+function run(argv) {
+  const chrome = Application(argv[0]);
+  const payload = JSON.parse(argv[1]);
+  const specs = Array.isArray(payload) ? payload : [payload];
+  const windows = chrome.running() ? chrome.windows().map(function (w) {
+    return { id: w.id(), title: w.name(), frame: w.bounds() };
+  }) : [];
+  const ids = specs.map(function (spec) {
+    const matches = windows.filter(function (w) {
+      const b = w.frame;
+      return spec.width > 0 && spec.height > 0 &&
+             Math.abs(b.x - spec.x) <= 2 && Math.abs(b.y - spec.y) <= 2 &&
+             Math.abs(b.width - spec.width) <= 2 && Math.abs(b.height - spec.height) <= 2 &&
+             (spec.title === null || w.title === spec.title);
+    });
+    return matches.length === 1 ? matches[0].id : null;
+  });
+  const unique = ids.map(function (id) {
+    return id !== null && ids.filter(function (other) { return other === id; }).length === 1 ? id : null;
+  });
+  return JSON.stringify(Array.isArray(payload) ? unique : unique[0]);
+}
+"#;
+
+    /// Set bounds by the resolved scripting ID. Chromium sometimes rejects
+    /// AXSize writes with -25200, so prefer its scripting dictionary.
     const SET_BOUNDS_SCRIPT: &str = r#"
 function run(argv) {
   const chrome = Application(argv[0]);
   const spec = JSON.parse(argv[1]);
   if (!chrome.running()) return 'error: browser not running';
-  const wins = chrome.windows();
-  let best = null, bestDist = Infinity;
-  for (let i = 0; i < wins.length; i++) {
-    let b;
-    try { b = wins[i].bounds(); } catch (e) { continue; }
-    const d = Math.abs(b.x - spec.fx) + Math.abs(b.y - spec.fy) +
-              Math.abs(b.width - spec.fw) + Math.abs(b.height - spec.fh);
-    if (d < bestDist) { bestDist = d; best = wins[i]; }
-  }
-  if (!best || bestDist > 60) return 'error: no window near source bounds (dist ' + bestDist + ')';
-  best.bounds = { x: spec.tx, y: spec.ty, width: spec.tw, height: spec.th };
-  return 'ok';
+  if (!Number.isSafeInteger(spec.windowId)) return 'error: missing window identity';
+  try {
+    const target = chrome.windows.byId(spec.windowId);
+    if (target.id() !== spec.windowId) return 'error: window identity changed';
+    target.bounds = { x: spec.tx, y: spec.ty, width: spec.tw, height: spec.th };
+    const bounds = target.bounds();
+    if (!(Math.abs(bounds.x - spec.tx) <= 2 && Math.abs(bounds.y - spec.ty) <= 2 &&
+          Math.abs(bounds.width - spec.tw) <= 2 && Math.abs(bounds.height - spec.th) <= 2))
+      return 'error: bounds could not be verified';
+    return 'ok';
+  } catch (e) { return 'error: ' + e; }
 }
 "#;
 
-    /// Returns `Ok(true)` when a window near `from` was moved to `to`.
-    pub fn set_window_bounds(bundle_id: &str, from: Frame, to: Frame) -> Result<bool> {
+    /// Returns `Ok(true)` only after the selected window's bounds are observed.
+    pub fn set_window_bounds(bundle_id: &str, window_id: i64, to: Frame) -> Result<bool> {
         let spec = serde_json::json!({
-            "fx": from.x.round() as i64,
-            "fy": from.y.round() as i64,
-            "fw": from.width.round() as i64,
-            "fh": from.height.round() as i64,
+            "windowId": window_id,
             "tx": to.x.round() as i64,
             "ty": to.y.round() as i64,
             "tw": to.width.round() as i64,
@@ -269,23 +277,19 @@ function run(argv) {
         }
     }
 
-    /// Returns `Ok(Some(n))` with the number of re-opened tabs, or `Ok(None)`
-    /// when the target window could not be located.
+    /// Number of reopened tabs, or None when reconciliation could not be confirmed.
     pub fn reconcile_window_tabs(
         bundle_id: &str,
+        window_id: i64,
         saved: &WindowSnapshot,
-        target: Frame,
     ) -> Result<Option<usize>> {
         if saved.browser_tabs.is_empty() {
             return Ok(Some(0));
         }
         let spec = serde_json::json!({
+            "windowId": window_id,
             "urls": saved.browser_tabs.iter().map(|t| t.url.as_str()).collect::<Vec<_>>(),
             "activeUrl": saved.browser_tabs.iter().find(|t| t.active).map(|t| t.url.as_str()),
-            "x": target.x.round() as i64,
-            "y": target.y.round() as i64,
-            "width": target.width.round() as i64,
-            "height": target.height.round() as i64,
         })
         .to_string();
         tracing::debug!(%spec, "running Chrome tab reconcile");
@@ -322,9 +326,58 @@ function run(argv) {
         }
     }
 
-    pub fn restore_windows(bundle_id: &str, windows: &[(&WindowSnapshot, Frame)]) -> Result<bool> {
+    pub fn resolve_window_ids(
+        bundle_id: &str,
+        observed: &[WindowSnapshot],
+    ) -> Result<Vec<Option<i64>>> {
+        let specs: Vec<_> = observed
+            .iter()
+            .map(|window| {
+                serde_json::json!({
+                    "title": window.title,
+                    "x": window.frame.x, "y": window.frame.y,
+                    "width": window.frame.width, "height": window.frame.height,
+                })
+            })
+            .collect();
+        let spec = serde_json::to_string(&specs)?;
+        let output = Command::new("/usr/bin/osascript")
+            .args([
+                "-l",
+                "JavaScript",
+                "-e",
+                RESOLVE_WINDOW_SCRIPT,
+                bundle_id,
+                &spec,
+            ])
+            .output()
+            .map_err(|e| WorkspaceError::MacOs(format!("browser identity lookup failed: {e}")))?;
+        if !output.status.success() {
+            return Err(WorkspaceError::MacOs(format!(
+                "browser identity lookup failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let ids: Vec<Option<i64>> = serde_json::from_slice(&output.stdout).map_err(|e| {
+            WorkspaceError::MacOs(format!("invalid browser identity response: {e}"))
+        })?;
+        if ids.len() != observed.len() {
+            return Err(WorkspaceError::MacOs(
+                "browser identity response has an incorrect window count".into(),
+            ));
+        }
+        Ok(ids)
+    }
+
+    pub fn restore_windows(
+        bundle_id: &str,
+        windows: &[(&WindowSnapshot, Frame)],
+    ) -> Result<BrowserRestoreResult> {
         if windows.is_empty() {
-            return Ok(true);
+            return Ok(BrowserRestoreResult {
+                windows: Vec::new(),
+                errors: Vec::new(),
+            });
         }
         let spec = restore_spec_json(windows);
         tracing::debug!(window_count = windows.len(), %spec, "running Chrome JXA restore");
@@ -351,14 +404,14 @@ function run(argv) {
             )));
         }
 
-        let errors = String::from_utf8_lossy(&output.stdout);
-        let errors = errors.trim();
-        if errors.is_empty() {
-            Ok(true)
-        } else {
-            tracing::warn!(%errors, "Chrome restore completed with per-window errors");
-            Ok(false)
+        let result: BrowserRestoreResult = serde_json::from_slice(&output.stdout)
+            .map_err(|e| WorkspaceError::MacOs(format!("invalid browser restore response: {e}")))?;
+        if result.windows.len() != windows.len() {
+            return Err(WorkspaceError::MacOs(
+                "browser restore response has an incorrect window count".into(),
+            ));
         }
+        Ok(result)
     }
 
     pub fn parse_chrome_windows_json(input: &str) -> serde_json::Result<Vec<ChromeWindowTabs>> {
@@ -386,9 +439,7 @@ function run(argv) {
             .collect())
     }
 
-    /// Serialize the restore targets to the JSON spec consumed by
-    /// `RESTORE_SCRIPT`. Passing data as an osascript argument (instead of
-    /// splicing it into script source) sidesteps quoting/escaping entirely.
+    /// Pass data as JSON arguments so URLs and titles never become script source.
     pub fn restore_spec_json(windows: &[(&WindowSnapshot, Frame)]) -> String {
         let specs: Vec<serde_json::Value> = windows
             .iter()
@@ -429,24 +480,33 @@ mod imp {
     pub fn restore_windows(
         _bundle_id: &str,
         _windows: &[(&WindowSnapshot, Frame)],
-    ) -> Result<bool> {
+    ) -> Result<BrowserRestoreResult> {
         Err(WorkspaceError::UnsupportedPlatform)
     }
 
     pub fn reconcile_window_tabs(
         _bundle_id: &str,
+        _window_id: i64,
         _saved: &WindowSnapshot,
-        _target: Frame,
     ) -> Result<Option<usize>> {
         Err(WorkspaceError::UnsupportedPlatform)
     }
 
-    pub fn set_window_bounds(_bundle_id: &str, _from: Frame, _to: Frame) -> Result<bool> {
+    pub fn set_window_bounds(_bundle_id: &str, _window_id: i64, _to: Frame) -> Result<bool> {
+        Err(WorkspaceError::UnsupportedPlatform)
+    }
+
+    pub fn resolve_window_ids(
+        _bundle_id: &str,
+        _observed: &[WindowSnapshot],
+    ) -> Result<Vec<Option<i64>>> {
         Err(WorkspaceError::UnsupportedPlatform)
     }
 }
 
-pub use imp::{capture_windows, reconcile_window_tabs, restore_windows, set_window_bounds};
+pub use imp::{
+    capture_windows, reconcile_window_tabs, resolve_window_ids, restore_windows, set_window_bounds,
+};
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {

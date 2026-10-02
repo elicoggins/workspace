@@ -1,7 +1,4 @@
-//! Terminal styling helpers.
-//!
-//! Honours `NO_COLOR` and only emits ANSI sequences when stdout is a TTY.
-//! All helpers are zero-allocation for the no-color path.
+//! Terminal styles, disabled when NO_COLOR is set or stdout is redirected.
 
 use std::io::IsTerminal;
 use std::sync::OnceLock;

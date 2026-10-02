@@ -221,8 +221,6 @@ fn run_restore(
     let snapshot = store.load(name)?;
     let resolved_mode = resolve_mode(mode, destructive);
 
-    // Fail fast with a clear error instead of a journal full of cryptic AX
-    // failures when the permission is missing.
     #[cfg(target_os = "macos")]
     if !dry_run {
         macos::accessibility::ensure_trusted()?;
@@ -231,9 +229,12 @@ fn run_restore(
     let max_iters = converge.max(1);
     let mut journals: Vec<execute::ExecutionJournal> = Vec::new();
     let mut final_verify = None;
+    #[cfg(target_os = "macos")]
+    let mut last_executor = None;
 
     for iter in 0..max_iters {
-        let plan = world::build_plan(&snapshot, resolved_mode, dev_mode)?;
+        let observed_world = world::observe_world()?;
+        let plan = world::plan_for_world(&snapshot, &observed_world, resolved_mode, dev_mode);
         let actionable = plan
             .operations
             .iter()
@@ -241,35 +242,28 @@ fn run_restore(
         let options = execute::ExecuteOptions { dry_run };
 
         let journal = if dry_run {
-            // Dry-run: use the planner output but never touch macOS. Drive a
-            // SimulatedExecutor seeded with the observed world so the journal
-            // shows the would-be ops without mutating state.
-            let world = world::observe_world()?;
-            let mut sim = execute::SimulatedExecutor::new(world);
-            execute::execute_plan(&snapshot, &plan, &mut sim, options)
+            execute::preview_plan(&snapshot, &plan)
         } else {
             #[cfg(target_os = "macos")]
             {
-                let world = world::observe_world()?;
-                let mut exec = execute::MacOsExecutor::new(world);
-                execute::execute_plan(&snapshot, &plan, &mut exec, options)
+                let exec = last_executor.insert(execute::MacOsExecutor::new(observed_world));
+                execute::execute_plan(&snapshot, &plan, exec, options)
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let world = world::observe_world()?;
-                let mut sim = execute::SimulatedExecutor::new(world);
+                let mut sim = execute::SimulatedExecutor::new(observed_world);
                 execute::execute_plan(&snapshot, &plan, &mut sim, options)
             }
         };
 
+        let operations_succeeded = journal.succeeded(&plan);
         journals.push(journal);
         let verify = world::verify_workspace(&snapshot)?;
-        let accuracy = verify.accuracy;
+        let converged = verify.converged && operations_succeeded;
         final_verify = Some(verify);
 
-        // Converge: stop early on 100% match, or when the plan had nothing
-        // actionable — re-planning an all-skip world can never change it.
-        if !actionable || accuracy >= 0.999 {
+        // Further passes cannot help an all-skip plan.
+        if dry_run || !actionable || converged {
             break;
         }
         if iter + 1 >= max_iters {
@@ -277,9 +271,9 @@ fn run_restore(
         }
     }
 
-    // Replay saved stacking order once geometry has settled.
-    if !dry_run {
-        world::replay_z_order(&snapshot);
+    #[cfg(target_os = "macos")]
+    if let Some(exec) = last_executor {
+        exec.replay_z_order(&snapshot);
     }
 
     if json {

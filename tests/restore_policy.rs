@@ -1,5 +1,4 @@
-//! Restore-policy behavior through the planner: which saved windows are
-//! planned for restore and which are skipped, and why.
+//! Restore policy and reservations for skipped windows.
 
 use chrono::{TimeZone, Utc};
 use workspace::{
@@ -8,7 +7,7 @@ use workspace::{
         DisplaySnapshot, Frame, HostInfo, RelativeFrame, WindowSnapshot, WorkspaceSnapshot,
         SNAPSHOT_VERSION,
     },
-    plan::{plan_restore, OperationKind, PlanOptions, WorldState},
+    plan::{plan_restore, LiveWindow, OperationKind, PlanOptions, RestoreMode, WorldState},
 };
 
 fn display() -> DisplaySnapshot {
@@ -97,8 +96,6 @@ fn plans_supported_windows_and_skips_unknown_windows() {
 
     let plan = plan_for(&snap);
 
-    // Every supported window gets an actionable op; the unknown window is
-    // skipped with an explanatory reason.
     for bundle in [
         "com.microsoft.VSCode",
         "com.google.Chrome",
@@ -116,7 +113,7 @@ fn plans_supported_windows_and_skips_unknown_windows() {
         .iter()
         .find(|op| matches!(&op.kind, OperationKind::Skip { .. }) && op.bundle_id.is_none())
         .expect("unknown window should be skipped");
-    assert!(skip.rationale.contains("without bundle identifiers"));
+    assert_eq!(skip.rationale, "missing app bundle identifier");
 }
 
 #[test]
@@ -200,4 +197,197 @@ fn disabled_windows_are_skipped_before_restore() {
         OperationKind::Skip { .. }
     ));
     assert!(plan.operations[0].rationale.contains("disabled"));
+}
+
+fn live(window: &WindowSnapshot, window_id: u32) -> LiveWindow {
+    LiveWindow {
+        bundle_id: window.bundle_id.clone(),
+        app_name: window.app_name.clone(),
+        pid: window.pid,
+        window_id,
+        title: window.title.clone(),
+        frame: window.frame,
+        minimized: false,
+    }
+}
+
+fn plan_in_world(
+    snapshot: &WorkspaceSnapshot,
+    windows: Vec<LiveWindow>,
+    mode: RestoreMode,
+    dev_mode: bool,
+) -> (workspace::plan::RestorePlan, WorldState) {
+    let mut world = WorldState::default();
+    for window in &windows {
+        if let Some(bundle) = &window.bundle_id {
+            world
+                .running_pids
+                .entry(bundle.clone())
+                .or_default()
+                .push(window.pid);
+        }
+    }
+    world.windows = windows;
+    let frames: Vec<_> = snapshot.windows.iter().map(|window| window.frame).collect();
+    let plan = plan_restore(snapshot, &world, PlanOptions { mode, dev_mode }, &frames);
+    (plan, world)
+}
+
+#[test]
+fn skipped_apps_never_receive_conflict_cleanup() {
+    for mode in [RestoreMode::Reconcile, RestoreMode::Destructive] {
+        let unsupported = window(Some("dev.example.Unknown"), "Unknown", 0);
+        let mut fullscreen = window(Some("com.apple.Terminal"), "Terminal", 1);
+        fullscreen.fullscreen = true;
+        let mut disabled = window(Some("com.apple.finder"), "Finder", 2);
+        disabled.enabled = false;
+        let windows = vec![unsupported, fullscreen, disabled];
+        let live: Vec<_> = windows
+            .iter()
+            .enumerate()
+            .map(|(index, window)| live(window, index as u32 + 1))
+            .collect();
+        let (plan, _) = plan_in_world(&snapshot(windows), live, mode, false);
+        assert_eq!(plan.destructive_ops, 0, "{plan:?}");
+        assert!(plan
+            .operations
+            .iter()
+            .all(|op| matches!(op.kind, OperationKind::Skip { .. })));
+    }
+}
+
+#[test]
+fn dev_mode_protects_editor_conflicts_while_restoring_their_windows() {
+    for bundle in ["com.microsoft.VSCode", "com.todesktop.230313mzl4w4u92"] {
+        for mode in [RestoreMode::Reconcile, RestoreMode::Destructive] {
+            let main = window(Some(bundle), "editor", 0);
+            let mut extra = main.clone();
+            extra.title = Some("unrelated editor window".into());
+            extra.frame.x += 1000.0;
+            let (plan, _) = plan_in_world(
+                &snapshot(vec![main.clone()]),
+                vec![live(&main, 1), live(&extra, 2)],
+                mode,
+                true,
+            );
+            assert_eq!(plan.summary().reposition, 1, "{plan:?}");
+            assert_eq!(plan.destructive_ops, 0, "{plan:?}");
+            assert_eq!(plan.left_alone_conflicts, 1, "{plan:?}");
+        }
+    }
+}
+
+#[test]
+fn skipped_windows_are_reserved_before_reuse_and_cleanup() {
+    for fullscreen in [false, true] {
+        for mode in [
+            RestoreMode::Safe,
+            RestoreMode::Reconcile,
+            RestoreMode::Destructive,
+        ] {
+            // Both windows have the same title, so reservation must account
+            // for distinct geometry rather than excluding a whole app/title.
+            let active = window(Some("com.apple.Terminal"), "Terminal", 0);
+            let mut protected = active.clone();
+            protected.frame.x += 1000.0;
+            protected.fullscreen = fullscreen;
+            protected.enabled = fullscreen;
+            let snap = snapshot(vec![active.clone(), protected.clone()]);
+            let (plan, world) = plan_in_world(&snap, vec![live(&protected, 7)], mode, false);
+            assert_eq!(plan.summary().create, 1, "{plan:?}");
+            assert_eq!(plan.summary().reposition, 0, "{plan:?}");
+            assert_eq!(plan.destructive_ops, 0, "{plan:?}");
+
+            let frames: Vec<_> = snap.windows.iter().map(|window| window.frame).collect();
+            let report = workspace::verify::verify(&snap, &world, &frames);
+            assert_eq!(report.skipped, 1);
+            assert_eq!(report.matched, 0, "{report:?}");
+            assert_eq!(report.unmatched, 1, "{report:?}");
+        }
+    }
+}
+
+#[test]
+fn equally_plausible_matches_protect_skipped_windows() {
+    for fullscreen in [false, true] {
+        let active = window(Some("com.apple.Terminal"), "Terminal", 0);
+        let mut protected = active.clone();
+        protected.fullscreen = fullscreen;
+        protected.enabled = fullscreen;
+        let snap = snapshot(vec![active, protected.clone()]);
+        let (plan, world) = plan_in_world(
+            &snap,
+            vec![live(&protected, 7)],
+            RestoreMode::Destructive,
+            false,
+        );
+        assert_eq!(plan.summary().create, 1, "{plan:?}");
+        assert_eq!(plan.summary().reposition, 0, "{plan:?}");
+        assert_eq!(plan.destructive_ops, 0, "{plan:?}");
+        let frames: Vec<_> = snap.windows.iter().map(|window| window.frame).collect();
+        let report = workspace::verify::verify(&snap, &world, &frames);
+        assert_eq!(report.matched, 0, "{report:?}");
+        assert_eq!(report.skipped, 1);
+    }
+}
+
+#[test]
+fn title_and_position_changes_do_not_expose_skipped_windows_to_cleanup() {
+    for fullscreen in [false, true] {
+        for mode in [RestoreMode::Reconcile, RestoreMode::Destructive] {
+            let active = window(Some("com.apple.Terminal"), "active", 0);
+            let mut protected = window(Some("com.apple.Terminal"), "old document", 1);
+            protected.frame.x += 1000.0;
+            protected.enabled = fullscreen;
+            protected.fullscreen = fullscreen;
+            let snap = snapshot(vec![active.clone(), protected]);
+            for title in [None, Some("different content")] {
+                for offset in [0.0, 300.0] {
+                    let mut renamed = live(&snap.windows[1], 2);
+                    renamed.title = title.map(str::to_string);
+                    renamed.frame.x += offset;
+                    let (plan, world) =
+                        plan_in_world(&snap, vec![live(&active, 1), renamed], mode, false);
+                    assert_eq!(plan.summary().reposition, 1, "{plan:?}");
+                    assert_eq!(plan.destructive_ops, 0, "{plan:?}");
+                    let frames: Vec<_> = snap.windows.iter().map(|window| window.frame).collect();
+                    assert!(workspace::verify::verify(&snap, &world, &frames).converged);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cleanup_still_targets_genuine_extras_beside_skipped_windows() {
+    for mode in [RestoreMode::Reconcile, RestoreMode::Destructive] {
+        let active = window(Some("com.apple.Terminal"), "Terminal", 0);
+        let mut protected = active.clone();
+        protected.enabled = false;
+        protected.frame.x += 1000.0;
+        let mut extra = active.clone();
+        extra.title = Some("extra".into());
+        extra.frame.x += 2000.0;
+        let snap = snapshot(vec![active.clone(), protected.clone()]);
+        let (plan, world) = plan_in_world(
+            &snap,
+            vec![live(&active, 1), live(&protected, 2), live(&extra, 3)],
+            mode,
+            false,
+        );
+        let cleanup: Vec<_> = plan
+            .operations
+            .iter()
+            .filter_map(|op| match op.kind {
+                OperationKind::CloseConflict { live_window_id, .. }
+                | OperationKind::MinimizeConflict { live_window_id, .. } => Some(live_window_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cleanup, vec![3], "{plan:?}");
+        let frames: Vec<_> = snap.windows.iter().map(|window| window.frame).collect();
+        let report = workspace::verify::verify(&snap, &world, &frames);
+        assert_eq!(report.matched, 1);
+        assert_eq!(report.accuracy, 1.0);
+    }
 }

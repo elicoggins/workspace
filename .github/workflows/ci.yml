@@ -24,6 +24,9 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      - name: Test browser scripts
+        run: node tests/browser_behavior.cjs
+
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings
 

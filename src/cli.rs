@@ -6,9 +6,9 @@ use crate::plan::RestoreMode;
 const TOP_AFTER_HELP: &str = "\
 Examples:
   workspace save coding              Capture the current window layout
-  workspace restore coding           Restore it (plan → execute → verify)
-  workspace restore coding --dry-run Preview without touching the system
-  workspace diff coding              See what's different and what would change
+  workspace restore coding           Restore the saved layout
+  workspace restore coding --dry-run Preview restore operations
+  workspace diff coding              Compare the snapshot with current windows
   workspace list                     Show all saved workspaces
   workspace doctor                   Check permissions and environment
 
@@ -17,18 +17,17 @@ Run 'workspace <COMMAND> --help' for command-specific options.";
 const RESTORE_AFTER_HELP: &str = "\
 Examples:
   workspace restore coding
-  workspace restore coding --converge 3          Retry up to 3 times
-  workspace restore coding --mode reconcile      Minimize extras
-  workspace restore coding --dry-run --json      Inspect the plan as JSON";
+  workspace restore coding --converge 3          Allow up to 3 restore passes
+  workspace restore coding --mode reconcile      Minimize extra windows
+  workspace restore coding --dry-run --json      Preview operations as JSON";
 
 #[derive(Debug, Parser)]
 #[command(
     name = "workspace",
-    about = "Save and restore macOS desktop window workspaces",
-    long_about = "Capture the current window layout (apps, geometry, browser tabs, displays) to a \
-JSON snapshot, then restore it deterministically with `restore`. Requires macOS Accessibility \
-permission to move windows; grant Screen Recording too so window titles are visible for reliable \
-matching.",
+    about = "Save and restore macOS window layouts",
+    long_about = "Save named window layouts, including displays and Chromium browser tabs.\n\n\
+Restoring requires Accessibility permission. Screen Recording exposes window titles \
+for matching and tab capture.",
     after_help = TOP_AFTER_HELP,
     version,
     arg_required_else_help = true,
@@ -42,15 +41,9 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Enable verbose tracing (RUST_LOG=workspace=debug)
+    /// Write debug logs to stderr
     #[arg(short, long, global = true)]
     pub verbose: bool,
-}
-
-impl Cli {
-    pub fn parse_args() -> Self {
-        Self::parse()
-    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -85,17 +78,17 @@ pub enum Command {
         force: bool,
     },
 
-    /// Restore a snapshot: plan → execute → verify, with a journal
+    /// Restore a saved window layout
     #[command(after_help = RESTORE_AFTER_HELP, alias = "apply")]
     Restore {
         /// Snapshot name
         name: String,
 
-        /// Show the plan without touching the system
+        /// Preview restore operations without changing windows
         #[arg(long)]
         dry_run: bool,
 
-        /// Protect VS Code / Cursor from destructive lifecycle actions
+        /// Skip launching or cleaning up VS Code and Cursor
         #[arg(long)]
         dev_mode: bool,
 
@@ -107,17 +100,17 @@ pub enum Command {
         #[arg(long)]
         destructive: bool,
 
-        /// Max plan→execute→verify iterations (1 = no retry)
+        /// Maximum number of restore passes
         #[arg(long, value_name = "N", default_value_t = 1)]
         converge: u32,
     },
 
-    /// Show what would change AND how far the world is from the snapshot
+    /// Compare current windows with a snapshot and show the restore plan
     Diff {
         /// Snapshot name
         name: String,
 
-        /// Protect VS Code / Cursor from destructive lifecycle actions
+        /// Skip launching or cleaning up VS Code and Cursor
         #[arg(long)]
         dev_mode: bool,
 
@@ -135,7 +128,7 @@ pub enum Command {
         /// Snapshot name
         name: String,
 
-        /// Protect VS Code / Cursor from destructive lifecycle actions
+        /// Skip launching or cleaning up VS Code and Cursor
         #[arg(long)]
         dev_mode: bool,
 
@@ -148,7 +141,7 @@ pub enum Command {
         destructive: bool,
     },
 
-    /// Compare the live world to a snapshot and report accuracy
+    /// Check window matches, visibility, and geometry against a snapshot
     Verify {
         /// Snapshot name
         name: String,
@@ -190,10 +183,9 @@ pub enum Command {
     /// Check environment: data dir, displays, Accessibility permission
     Doctor,
 
-    /// Exercise the REAL macOS pipeline end-to-end and report PASS/FAIL
+    /// Check capture, planning, and verification on this Mac
     Selftest {
-        /// Also move one window 40px and restore it via the real executor
-        /// (mutates your desktop briefly)
+        /// Also move a window briefly, then restore the snapshot
         #[arg(long)]
         live: bool,
     },

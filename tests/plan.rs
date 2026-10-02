@@ -1,7 +1,8 @@
 use chrono::Utc;
 use workspace::model::{Frame, HostInfo, WindowSnapshot, WorkspaceSnapshot, SNAPSHOT_VERSION};
 use workspace::plan::{
-    plan_restore, LiveWindow, OperationKind, PlanOptions, RestoreMode, WorldState,
+    compute_match_score, plan_restore, LiveWindow, OperationKind, PlanOptions, RestoreMode,
+    WorldState,
 };
 
 fn frame(x: f64, y: f64) -> Frame {
@@ -48,6 +49,91 @@ fn snapshot(windows: Vec<WindowSnapshot>) -> WorkspaceSnapshot {
     }
 }
 
+fn observed(bundle: &str, title: Option<&str>, frame: Frame) -> LiveWindow {
+    LiveWindow {
+        bundle_id: Some(bundle.to_string()),
+        app_name: bundle.to_string(),
+        pid: 99,
+        window_id: 10,
+        title: title.map(str::to_string),
+        frame,
+        minimized: false,
+    }
+}
+
+#[test]
+fn unrelated_titles_do_not_match_on_size_alone() {
+    let bundle = "com.apple.Terminal";
+    let saved = saved(bundle, "Documentation", frame(0.0, 0.0));
+    for x in [600.0, 5000.0] {
+        let live = observed(bundle, Some("Budget"), frame(x, 0.0));
+        assert!(!compute_match_score(&saved, &live).is_acceptable());
+        let world = WorldState {
+            windows: vec![live],
+            running_pids: std::collections::HashMap::from([(bundle.to_string(), vec![99])]),
+            ..WorldState::default()
+        };
+        let plan = plan_restore(
+            &snapshot(vec![saved.clone()]),
+            &world,
+            PlanOptions::default(),
+            &[saved.frame],
+        );
+        assert!(!plan
+            .operations
+            .iter()
+            .any(|op| matches!(op.kind, OperationKind::Reposition { .. })));
+    }
+}
+
+#[test]
+fn weak_title_overlap_does_not_override_geometry() {
+    let bundle = "com.apple.Terminal";
+    let saved = saved(bundle, "project docs outline", frame(0.0, 0.0));
+    let live = observed(bundle, Some("project budget invoices"), frame(5000.0, 0.0));
+    assert!(!compute_match_score(&saved, &live).is_acceptable());
+}
+
+#[test]
+fn changed_titles_require_close_geometry() {
+    let bundle = "com.apple.Terminal";
+    let saved = saved(bundle, "old session", frame(0.0, 0.0));
+    let near = observed(bundle, Some("fresh document"), frame(5.0, 8.0));
+    assert!(compute_match_score(&saved, &near).is_acceptable());
+    let far = observed(bundle, Some("fresh document"), frame(600.0, 0.0));
+    assert!(!compute_match_score(&saved, &far).is_acceptable());
+}
+
+#[test]
+fn missing_and_blank_titles_require_close_geometry() {
+    let bundle = "com.apple.Terminal";
+    for title in [None, Some(""), Some(" \t "), Some("...")] {
+        let mut saved = saved(bundle, "ignored", frame(0.0, 0.0));
+        saved.title = title.map(str::to_string);
+        let far = observed(bundle, title, frame(600.0, 0.0));
+        assert!(!compute_match_score(&saved, &far).is_acceptable());
+
+        let near = observed(bundle, title, frame(5.0, 8.0));
+        let score = compute_match_score(&saved, &near);
+        assert!(!score.title_evidence);
+        assert!(score.is_acceptable());
+    }
+}
+
+#[test]
+fn strong_title_matches_survive_geometry_drift() {
+    let bundle = "com.apple.Terminal";
+    for (saved_title, live_title) in [
+        ("Project", "Project"),
+        ("Project", "  PROJECT  "),
+        ("Project README.md", "Project README.md — Editor"),
+    ] {
+        let saved = saved(bundle, saved_title, frame(0.0, 0.0));
+        let live = observed(bundle, Some(live_title), frame(5000.0, 0.0));
+        assert!(compute_match_score(&saved, &live).is_acceptable());
+    }
+}
+
 #[test]
 fn safe_mode_never_emits_close_operations_for_user_apps() {
     let bundle = "com.apple.Terminal";
@@ -73,7 +159,7 @@ fn safe_mode_never_emits_close_operations_for_user_apps() {
                 frame: frame(100.0, 100.0),
                 minimized: false,
             },
-            // unrelated app — must NEVER be touched
+            // Outside the snapshot; cleanup must leave it alone.
             LiveWindow {
                 bundle_id: Some("com.apple.Notes".to_string()),
                 app_name: "Notes".to_string(),

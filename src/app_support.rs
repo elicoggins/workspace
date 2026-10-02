@@ -11,8 +11,7 @@ pub struct KnownApp {
     pub bundle_id: &'static str,
     pub name: &'static str,
     pub support: AppSupport,
-    /// Chromium-family browsers whose tabs we capture and restore via the
-    /// shared AppleScript dictionary (`windows`/`tabs`/`URL`).
+    /// Uses Chromium's scripting dictionary for tab capture and restore.
     pub tab_capture: bool,
 }
 
@@ -22,173 +21,123 @@ pub enum SupportLevel {
     Unsupported,
 }
 
+const WINDOW_RESTORE: AppSupport = AppSupport {
+    level: SupportLevel::FullRestore,
+    reason: "window geometry and z-order restore enabled",
+};
+
+const WINDOW_AND_TAB_RESTORE: AppSupport = AppSupport {
+    level: SupportLevel::FullRestore,
+    reason: "window geometry and tab restore enabled",
+};
+
 pub const KNOWN_APPS: &[KnownApp] = &[
     KnownApp {
         bundle_id: "com.microsoft.VSCode",
         name: "Visual Studio Code",
-        support: AppSupport {
-            level: SupportLevel::FullRestore,
-            reason: "VS Code window geometry and z-order restore are currently supported",
-        },
-
+        support: WINDOW_RESTORE,
         tab_capture: false,
     },
     KnownApp {
         bundle_id: "com.google.Chrome",
         name: "Google Chrome",
-        support: AppSupport {
-            level: SupportLevel::FullRestore,
-            reason: "Chrome window geometry and z-order restore are enabled",
-        },
-
+        support: WINDOW_AND_TAB_RESTORE,
         tab_capture: true,
     },
     KnownApp {
         bundle_id: "com.apple.Safari",
         name: "Safari",
-        support: AppSupport {
-            level: SupportLevel::FullRestore,
-            reason: "Safari window geometry and z-order restore are enabled",
-        },
-
+        support: WINDOW_RESTORE,
         tab_capture: false,
     },
     KnownApp {
         bundle_id: "com.apple.Terminal",
         name: "Terminal",
-        support: AppSupport {
-            level: SupportLevel::FullRestore,
-            reason: "Terminal window geometry and z-order restore are enabled",
-        },
-
+        support: WINDOW_RESTORE,
         tab_capture: false,
     },
     KnownApp {
         bundle_id: "com.googlecode.iterm2",
         name: "iTerm2",
-        support: AppSupport {
-            level: SupportLevel::FullRestore,
-            reason: "iTerm2 window geometry and z-order restore are enabled",
-        },
-
+        support: WINDOW_RESTORE,
         tab_capture: false,
     },
     KnownApp {
         bundle_id: "dev.warp.Warp-Stable",
         name: "Warp",
-        support: AppSupport {
-            level: SupportLevel::FullRestore,
-            reason: "Warp window geometry and z-order restore are enabled",
-        },
-
+        support: WINDOW_RESTORE,
         tab_capture: false,
     },
     KnownApp {
         bundle_id: "com.todesktop.230313mzl4w4u92",
         name: "Cursor",
-        support: AppSupport {
-            level: SupportLevel::FullRestore,
-            reason: "Cursor window geometry and z-order restore are enabled",
-        },
-
+        support: WINDOW_RESTORE,
         tab_capture: false,
     },
     KnownApp {
         bundle_id: "com.apple.dt.Xcode",
         name: "Xcode",
-        support: AppSupport {
-            level: SupportLevel::FullRestore,
-            reason: "Xcode window geometry and z-order restore are enabled",
-        },
-
+        support: WINDOW_RESTORE,
         tab_capture: false,
     },
     KnownApp {
         bundle_id: "com.apple.finder",
         name: "Finder",
-        support: AppSupport {
-            level: SupportLevel::FullRestore,
-            reason: "Finder window geometry and z-order restore are enabled",
-        },
-
+        support: WINDOW_RESTORE,
         tab_capture: false,
     },
     KnownApp {
         bundle_id: "com.apple.Notes",
         name: "Notes",
-        support: AppSupport {
-            level: SupportLevel::FullRestore,
-            reason: "Notes window geometry and z-order restore are enabled",
-        },
-
+        support: WINDOW_RESTORE,
         tab_capture: false,
     },
     KnownApp {
         bundle_id: "com.apple.Music",
         name: "Music",
-        support: AppSupport {
-            level: SupportLevel::FullRestore,
-            reason: "Music window geometry and z-order restore are enabled",
-        },
-
+        support: WINDOW_RESTORE,
         tab_capture: false,
     },
     KnownApp {
         bundle_id: "com.apple.MobileSMS",
         name: "Messages",
-        support: AppSupport {
-            level: SupportLevel::FullRestore,
-            reason: "Messages window geometry and z-order restore are enabled",
-        },
-
+        support: WINDOW_RESTORE,
         tab_capture: false,
     },
     KnownApp {
         bundle_id: "com.google.Chrome.canary",
         name: "Google Chrome Canary",
-        support: AppSupport {
-            level: SupportLevel::FullRestore,
-            reason: "Chrome Canary window geometry and tab restore are enabled",
-        },
+        support: WINDOW_AND_TAB_RESTORE,
         tab_capture: true,
     },
     KnownApp {
         bundle_id: "com.brave.Browser",
         name: "Brave Browser",
-        support: AppSupport {
-            level: SupportLevel::FullRestore,
-            reason: "Brave window geometry and tab restore are enabled",
-        },
+        support: WINDOW_AND_TAB_RESTORE,
         tab_capture: true,
     },
     KnownApp {
         bundle_id: "com.microsoft.edgemac",
         name: "Microsoft Edge",
-        support: AppSupport {
-            level: SupportLevel::FullRestore,
-            reason: "Edge window geometry and tab restore are enabled",
-        },
+        support: WINDOW_AND_TAB_RESTORE,
         tab_capture: true,
     },
     KnownApp {
         bundle_id: "org.chromium.Chromium",
         name: "Chromium",
-        support: AppSupport {
-            level: SupportLevel::FullRestore,
-            reason: "Chromium window geometry and tab restore are enabled",
-        },
+        support: WINDOW_AND_TAB_RESTORE,
         tab_capture: true,
     },
 ];
 
 const UNKNOWN_BUNDLE_SUPPORT: AppSupport = AppSupport {
     level: SupportLevel::Unsupported,
-    reason: "this app is not in the supported restore allowlist yet",
+    reason: "app is not supported for restore",
 };
 
 const MISSING_BUNDLE_SUPPORT: AppSupport = AppSupport {
     level: SupportLevel::Unsupported,
-    reason: "windows without bundle identifiers are not restored yet",
+    reason: "missing app bundle identifier",
 };
 
 pub fn support_for_window(window: &WindowSnapshot) -> AppSupport {

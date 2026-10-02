@@ -1,13 +1,9 @@
-//! Live smoke test — exercises the REAL macOS executor, which the ordinary
-//! suite (built on `SimulatedExecutor`) structurally cannot cover.
-//!
-//! Run manually before releases, on a machine with Accessibility granted:
+//! Runs the live selftest against the desktop with Accessibility permission.
+//! This moves a window and restores the snapshot.
 //!
 //! ```sh
 //! cargo test --test live_smoke -- --ignored
 //! ```
-//!
-//! It briefly moves one of your windows by 40 px and puts it back.
 
 #[test]
 #[ignore = "drives the real macOS window server; run manually with -- --ignored"]

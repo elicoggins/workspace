@@ -2,7 +2,7 @@
 name = "workspace"
 version = "0.1.0"
 edition = "2021"
-description = "A macOS-first CLI for saving and restoring desktop window workspaces."
+description = "Save and restore macOS window layouts."
 readme = "README.md"
 license = "MIT"
 publish = false
@@ -23,8 +23,7 @@ dialoguer = "0.11"
 libc = "0.2"
 objc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
-# float_roundtrip: parse(print(f64)) must be exact, or every snapshot
-# load perturbs geometry by 1 ULP and equality checks fail.
+# Keep window geometry exact through JSON round trips.
 serde_json = { version = "1.0", features = ["float_roundtrip"] }
 thiserror = "1.0"
 tracing = "0.1"
@@ -35,4 +34,5 @@ tempfile = "3.10"
 proptest = "1.5"
 
 [lints.rust]
-unexpected_cfgs = "allow"
+# objc macros emit this legacy feature check in the calling crate.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }

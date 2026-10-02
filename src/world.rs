@@ -1,8 +1,4 @@
-//! World observation, display remapping, and diagnostics.
-//!
-//! Everything here is glue between the pure planner/verifier and the live
-//! macOS world: observe the current windows, project saved windows onto the
-//! current displays, and report environment health.
+//! Observe macOS windows, remap display geometry, and check the environment.
 
 use std::collections::HashMap;
 
@@ -19,8 +15,7 @@ use crate::{
 
 const RESTORE_MARGIN: f64 = 12.0;
 
-/// Snapshot the current macOS world into a [`WorldState`] suitable for the
-/// pure planner. Returns an empty world on non-macOS targets.
+/// Read current displays, windows, and running apps for the planner.
 pub fn observe_world() -> Result<WorldState> {
     let displays = display::current_displays()?;
     let raw_windows = window::enumerate_windows()?;
@@ -53,10 +48,8 @@ pub fn observe_world() -> Result<WorldState> {
         });
     }
 
-    // CGWindowList only reports on-screen windows: minimized windows are
-    // invisible to it, which used to make the planner treat them as missing
-    // and open duplicates. Enrich the world with AX-visible minimized windows
-    // (and register pids) for every supported app that is running.
+    // The on-screen CG list omits minimized windows. AX supplies those entries;
+    // their synthetic IDs are valid only for this observation.
     let mut synthetic_id = u32::MAX;
     for known in crate::app_support::full_restore_apps() {
         for pid in app::running_pids_for_bundle(known.bundle_id) {
@@ -100,37 +93,40 @@ pub fn build_plan(
     mode: crate::plan::RestoreMode,
     dev_mode: bool,
 ) -> Result<RestorePlan> {
-    let current_displays = display::current_displays()?;
-    let mut target_frames = Vec::with_capacity(snapshot.windows.len());
-    for window in &snapshot.windows {
-        target_frames.push(target_frame_for_window(
-            window,
-            &snapshot.displays,
-            &current_displays,
-        ));
-    }
     let world = observe_world()?;
-    Ok(plan_restore(
+    Ok(plan_for_world(snapshot, &world, mode, dev_mode))
+}
+
+/// Plan against the same observation that will be given to the executor.
+/// This also keeps synthetic minimized-window IDs consistent within a run.
+pub fn plan_for_world(
+    snapshot: &WorkspaceSnapshot,
+    world: &WorldState,
+    mode: crate::plan::RestoreMode,
+    dev_mode: bool,
+) -> RestorePlan {
+    let target_frames = target_frames(snapshot, &world.displays);
+    plan_restore(
         snapshot,
-        &world,
+        world,
         PlanOptions { mode, dev_mode },
         &target_frames,
-    ))
+    )
 }
 
 /// Compare a snapshot to the current world and produce a verification report.
 pub fn verify_workspace(snapshot: &WorkspaceSnapshot) -> Result<verify_mod::VerifyReport> {
-    let current_displays = display::current_displays()?;
-    let mut target_frames = Vec::with_capacity(snapshot.windows.len());
-    for window in &snapshot.windows {
-        target_frames.push(target_frame_for_window(
-            window,
-            &snapshot.displays,
-            &current_displays,
-        ));
-    }
     let world = observe_world()?;
+    let target_frames = target_frames(snapshot, &world.displays);
     Ok(verify_mod::verify(snapshot, &world, &target_frames))
+}
+
+fn target_frames(snapshot: &WorkspaceSnapshot, displays: &[DisplaySnapshot]) -> Vec<Frame> {
+    snapshot
+        .windows
+        .iter()
+        .map(|window| target_frame_for_window(window, &snapshot.displays, displays))
+        .collect()
 }
 
 /// Best-effort z-order replay: raise restorable windows back-to-front so the
@@ -161,10 +157,6 @@ pub fn replay_z_order(snapshot: &WorkspaceSnapshot) {
     }
 }
 
-// -----------------------------------------------------------------------
-// Display remapping
-// -----------------------------------------------------------------------
-
 pub fn target_frame_for_window(
     window: &WindowSnapshot,
     saved_displays: &[DisplaySnapshot],
@@ -185,14 +177,15 @@ pub fn target_frame_for_window(
         });
 
     if let Some(saved_display) = saved_display {
-        if let Some(current) = exact_current_display(saved_display, current_displays) {
-            if frame_fits_display(window.frame, current.frame) {
+        let mapped = matching_current_display(saved_display, current_displays)
+            .unwrap_or_else(|| best_current_display(saved_display, current_displays));
+        if same_frame(saved_display.frame, mapped.frame) {
+            if frame_fits_display(window.frame, mapped.frame) {
                 return window.frame;
             }
-            return clamp_to_display(window.frame, current.frame);
+            return clamp_to_display(window.frame, mapped.frame);
         }
 
-        let mapped = best_current_display(saved_display, current_displays);
         let relative = window
             .display_relative_frame
             .unwrap_or_else(|| window.frame.relative_to(saved_display.frame));
@@ -206,17 +199,17 @@ pub fn target_frame_for_window(
     clamp_to_display(window.frame, current.frame)
 }
 
-fn exact_current_display<'a>(
+fn matching_current_display<'a>(
     saved: &DisplaySnapshot,
     current_displays: &'a [DisplaySnapshot],
 ) -> Option<&'a DisplaySnapshot> {
     current_displays
         .iter()
-        .find(|current| current.id == saved.id && current.frame == saved.frame)
+        .find(|current| current.id == saved.id)
         .or_else(|| {
-            current_displays.iter().find(|current| {
-                current.numeric_id == saved.numeric_id && same_frame(current.frame, saved.frame)
-            })
+            current_displays
+                .iter()
+                .find(|current| current.numeric_id == saved.numeric_id)
         })
 }
 
@@ -283,10 +276,6 @@ pub fn clamp_to_display(frame: Frame, display: Frame) -> Frame {
     }
 }
 
-// -----------------------------------------------------------------------
-// Doctor
-// -----------------------------------------------------------------------
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DoctorReport {
     pub data_dir: String,
@@ -324,10 +313,7 @@ pub fn doctor() -> Result<DoctorReport> {
         warnings.push("no displays detected".to_string());
     }
 
-    // Window titles come from CGWindowList and require the Screen Recording
-    // permission on modern macOS. Without them, save still works but window
-    // matching degrades to geometry-only and browser tab attribution falls
-    // back to window order.
+    // Missing CG titles can indicate that Screen Recording access is absent.
     let visible: Vec<_> = window::enumerate_windows()
         .unwrap_or_default()
         .into_iter()

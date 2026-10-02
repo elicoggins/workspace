@@ -4,4 +4,4 @@
 *.orig
 .env
 .env.*
-*.md
+/CODEBASE_REVIEW.md

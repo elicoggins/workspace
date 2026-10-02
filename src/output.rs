@@ -155,7 +155,7 @@ pub fn print_restore_plan(plan: &crate::plan::RestorePlan) {
 pub fn print_verify_report(report: &crate::verify::VerifyReport) {
     let pct = report.accuracy * 100.0;
     let pct_str = format!("{pct:.1}%");
-    let pct_styled = if pct >= 99.9 {
+    let pct_styled = if report.converged {
         style::green(&pct_str)
     } else if pct >= 80.0 {
         style::yellow(&pct_str)
@@ -164,9 +164,10 @@ pub fn print_verify_report(report: &crate::verify::VerifyReport) {
     };
     let restorable = report.total - report.skipped;
     println!(
-        "{} {}  {} matched ({}/{} restorable, {} skipped, drift mean {:.1}px, max {:.1}px)",
+        "{} {}  layout {} (score {}, {}/{} windows matched, {} skipped, drift mean {:.1}pt, max {:.1}pt)",
         style::bold("verify:"),
         report.snapshot,
+        if report.converged { "complete" } else { "incomplete" },
         pct_styled,
         report.matched,
         restorable,
@@ -190,6 +191,22 @@ pub fn print_verify_report(report: &crate::verify::VerifyReport) {
                 entry.bundle_id.as_deref().unwrap_or("?")
             );
         }
+    }
+    for entry in report
+        .windows
+        .iter()
+        .filter(|entry| entry.matched && !entry.is_satisfied())
+    {
+        let detail = if entry.observed_minimized == Some(true) {
+            "minimized"
+        } else {
+            "geometry differs by more than 2 points"
+        };
+        println!(
+            "  - {} ({}): {detail}",
+            entry.app_name,
+            entry.bundle_id.as_deref().unwrap_or("?")
+        );
     }
 }
 

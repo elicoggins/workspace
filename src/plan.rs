@@ -1,19 +1,7 @@
-//! Pure restore planning.
+//! Match saved windows to an observed world and build a restore plan.
 //!
-//! The planner takes a saved [`WorkspaceSnapshot`] plus an observed
-//! [`WorldState`] (current displays + live windows + running apps) and produces a
-//! deterministic [`RestorePlan`].  Execution is intentionally pushed elsewhere
-//! (`execute.rs`) so the planner can be exercised exhaustively from unit tests
-//! without ever touching real macOS APIs.
-//!
-//! The planner is the trust boundary of the application:
-//!
-//! - it decides whether each saved window can be reused, repositioned, launched,
-//!   or skipped
-//! - it produces a [`MatchScore`] for every saved/live window pairing it
-//!   considered, so behavior is observable and debuggable
-//! - it expresses *why* each operation exists via the `rationale` string
-//! - it gates destructive behavior behind [`RestoreMode::Destructive`]
+//! Planning makes no platform calls. Each operation carries a reason for the
+//! journal and preview output.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -24,17 +12,16 @@ use crate::{
     model::{DisplaySnapshot, Frame, WindowSnapshot, WorkspaceSnapshot},
 };
 
-/// How aggressively the planner should reconcile the existing world.
+/// Policy for extra windows belonging to apps being restored.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RestoreMode {
-    /// Never close or minimize user windows. Only reposition / launch what we need.
+    /// Move, launch, or create windows; leave extra windows alone.
     #[default]
     Safe,
-    /// Same as Safe but the planner may minimize conflicting extra windows
-    /// belonging to an app it is also restoring.
+    /// Also allow minimizing extra windows.
     Reconcile,
-    /// Allowed to close conflicting extra windows of apps it is restoring.
+    /// Also allow closing extra windows.
     Destructive,
 }
 
@@ -48,8 +35,7 @@ impl RestoreMode {
     }
 }
 
-/// A window currently visible on the user's machine, abstracted from the
-/// macOS APIs so tests can construct fake worlds easily.
+/// An observed CG or AX window, including minimized windows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiveWindow {
     pub bundle_id: Option<String>,
@@ -85,15 +71,13 @@ impl WorldState {
     }
 }
 
-/// Explainable confidence score for a saved -> live window match.
+/// Components of a saved-to-live match score.
 #[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MatchScore {
     pub title_similarity: f32,
     pub geometry_similarity: f32,
     pub bundle_match: bool,
-    /// Both windows actually had titles to compare. Without Screen Recording
-    /// permission every live title is `None`, and a title-blind score is far
-    /// weaker evidence of identity than the same number with titles.
+    /// Whether both titles contained text after normalization.
     #[serde(default)]
     pub title_evidence: bool,
     pub final_score: f32,
@@ -101,15 +85,15 @@ pub struct MatchScore {
 
 impl MatchScore {
     pub const MIN_ACCEPT: f32 = 0.20;
-    /// Without title evidence, only near-exact geometry counts as identity —
-    /// a permissive floor lets a saved window hijack whatever window of the
-    /// same app happens to be open (observed live: a snapshot whose Chrome
-    /// window was closed matched and relocated an unrelated Chrome window).
-    pub const GEOMETRY_ONLY_MIN: f32 = 0.85;
+    pub const TITLE_MIN_ACCEPT: f32 = 0.50;
+    /// Stricter geometry threshold when either title is missing or blank.
+    pub const GEOMETRY_ONLY_MIN: f32 = 0.99;
 
     pub fn is_acceptable(&self) -> bool {
-        self.final_score >= Self::MIN_ACCEPT
-            && (self.title_evidence || self.geometry_similarity >= Self::GEOMETRY_ONLY_MIN)
+        self.bundle_match
+            && self.final_score >= Self::MIN_ACCEPT
+            && ((self.title_evidence && self.title_similarity >= Self::TITLE_MIN_ACCEPT)
+                || self.geometry_similarity >= Self::GEOMETRY_ONLY_MIN)
     }
 
     pub fn explain(&self) -> String {
@@ -130,15 +114,14 @@ pub enum OperationKind {
         live_window_id: u32,
         target_frame: Frame,
     },
-    /// App is not running; spawn it before any geometry work.
+    /// Launch the app before restoring its windows.
     LaunchApp { bundle_id: String },
-    /// App is running but exposes fewer windows than the snapshot needs;
-    /// the executor should send Cmd+N (or equivalent) to create one.
+    /// Ask the app for an additional window.
     CreateWindow {
         bundle_id: String,
         target_frame: Frame,
     },
-    /// Replay captured Chrome tab URLs into a fresh window.
+    /// Open captured browser tabs in a new window.
     RestoreChromeTabs {
         bundle_id: String,
         target_frame: Frame,
@@ -149,7 +132,7 @@ pub enum OperationKind {
     /// Destructive mode: close a live window that does not correspond to any
     /// saved window.
     CloseConflict { live_pid: i32, live_window_id: u32 },
-    /// No action; the window is intentionally not restored.
+    /// Leave this saved window untouched.
     Skip { reason: String },
 }
 
@@ -238,11 +221,7 @@ pub fn is_dev_mode_protected_bundle(bundle_id: &str) -> bool {
     DEV_MODE_PROTECTED_BUNDLES.contains(&bundle_id)
 }
 
-/// Why a saved window is excluded from restore, if it is.
-///
-/// Single source of truth for the skip gates shared by the planner and
-/// `verify` — verify must not count windows the planner refuses to restore,
-/// otherwise accuracy can never reach 100% and `--converge` never stops early.
+/// Policy exclusions shared by planning and verification.
 pub fn restore_skip_reason(window: &WindowSnapshot) -> Option<String> {
     if !window.enabled {
         return Some("disabled in workspace configuration".to_string());
@@ -252,12 +231,12 @@ pub fn restore_skip_reason(window: &WindowSnapshot) -> Option<String> {
         return Some(support.reason.to_string());
     }
     if window.fullscreen {
-        return Some("fullscreen windows are not resized in this version".to_string());
+        return Some("fullscreen windows are skipped".to_string());
     }
     None
 }
 
-/// Build a deterministic plan from a snapshot + observed world.
+/// Build a plan with one target frame per saved window.
 pub fn plan_restore(
     snapshot: &WorkspaceSnapshot,
     world: &WorldState,
@@ -345,7 +324,6 @@ fn plan_group(
     let first = &snapshot.windows[indices[0]];
     let bundle_id = first.bundle_id.clone();
 
-    // ---- skip-before-touching gates ----
     for &index in indices {
         let window = &snapshot.windows[index];
         if let Some(reason) = restore_skip_reason(window) {
@@ -353,7 +331,6 @@ fn plan_group(
         }
     }
 
-    // Filter to indices that survived the skip gates so we don't double-handle.
     let active_indices: Vec<usize> = indices
         .iter()
         .copied()
@@ -365,21 +342,14 @@ fn plan_group(
     }
 
     let Some(bundle_id) = bundle_id else {
-        // No bundle id -> already skipped above by SupportLevel::Unsupported,
-        // but guard defensively in case the support table ever grows.
         for index in active_indices {
             let window = &snapshot.windows[index];
             unmatched_saved.push(index);
-            operations.push(plan_skip(
-                window,
-                index,
-                "missing bundle identifier".to_string(),
-            ));
+            operations.push(skip(window, index, "missing bundle identifier".to_string()));
         }
         return;
     };
 
-    // ---- launch decision ----
     let app_running = world.is_running(&bundle_id);
     let dev_protected = options.dev_mode && is_dev_mode_protected_bundle(&bundle_id);
     if !app_running {
@@ -387,7 +357,7 @@ fn plan_group(
             for index in active_indices {
                 let window = &snapshot.windows[index];
                 unmatched_saved.push(index);
-                operations.push(plan_skip(
+                operations.push(skip(
                     window,
                     index,
                     "dev-mode: not launching protected editor".to_string(),
@@ -407,35 +377,36 @@ fn plan_group(
         });
     }
 
-    // ---- per-window matching (within this app) ----
     let live_candidates: Vec<&LiveWindow> = world
         .windows
         .iter()
         .filter(|window| window.bundle_id.as_deref() == Some(bundle_id.as_str()))
         .collect();
 
-    let saved: Vec<&WindowSnapshot> = active_indices
+    // Skipped windows still participate in matching: their live counterparts
+    // are reserved so neither reuse nor conflict cleanup can touch them.
+    let saved: Vec<&WindowSnapshot> = indices
         .iter()
         .map(|index| &snapshot.windows[*index])
         .collect();
-    let saved_frames: Vec<Frame> = active_indices
-        .iter()
-        .map(|index| target_frames[*index])
-        .collect();
 
-    let assignments = assign_matches(&saved, &live_candidates, consumed_live);
+    let targets: Vec<_> = indices.iter().map(|index| target_frames[*index]).collect();
+    let assignments = assign_matches(&saved, &targets, &live_candidates, consumed_live);
 
     let tab_capable = crate::app_support::is_tab_capable(Some(bundle_id.as_str()));
 
-    for ((local_index, &saved_index), assignment) in
-        active_indices.iter().enumerate().zip(assignments)
-    {
+    for (&saved_index, assignment) in indices.iter().zip(assignments) {
         let window = &snapshot.windows[saved_index];
-        let target_frame = saved_frames[local_index];
+        if let Some((live_index, _)) = assignment {
+            consumed_live.insert(live_candidates[live_index].window_id);
+        }
+        if restore_skip_reason(window).is_some() {
+            continue;
+        }
+        let target_frame = target_frames[saved_index];
 
         if let Some((live_index, score)) = assignment {
             let live = live_candidates[live_index];
-            consumed_live.insert(live.window_id);
             operations.push(PlannedOperation {
                 kind: OperationKind::Reposition {
                     live_pid: live.pid,
@@ -483,10 +454,6 @@ fn plan_group(
     }
 }
 
-fn plan_skip(window: &WindowSnapshot, _index: usize, reason: String) -> PlannedOperation {
-    skip(window, _index, reason)
-}
-
 fn skip(window: &WindowSnapshot, index: usize, reason: String) -> PlannedOperation {
     PlannedOperation {
         kind: OperationKind::Skip {
@@ -511,12 +478,7 @@ fn plan_conflicts(
 ) {
     // Build the set of bundle ids the workspace is restoring -- we only act on
     // conflicts for apps the workspace owns, never on unrelated user windows.
-    let owned_bundles: HashSet<&str> = snapshot
-        .windows
-        .iter()
-        .filter(|window| window.enabled)
-        .filter_map(|window| window.bundle_id.as_deref())
-        .collect();
+    let owned_bundles = restorable_bundles(snapshot);
 
     for live in &world.windows {
         if consumed_live.contains(&live.window_id) {
@@ -526,7 +488,9 @@ fn plan_conflicts(
             *left_alone_conflicts += 1;
             continue;
         };
-        if !owned_bundles.contains(bundle_id) {
+        if !owned_bundles.contains(bundle_id)
+            || (options.dev_mode && is_dev_mode_protected_bundle(bundle_id))
+        {
             *left_alone_conflicts += 1;
             continue;
         }
@@ -574,12 +538,7 @@ fn count_unconsumed_conflicts(
     world: &WorldState,
     consumed_live: &HashSet<u32>,
 ) -> usize {
-    let owned_bundles: HashSet<&str> = snapshot
-        .windows
-        .iter()
-        .filter(|window| window.enabled)
-        .filter_map(|window| window.bundle_id.as_deref())
-        .collect();
+    let owned_bundles = restorable_bundles(snapshot);
     world
         .windows
         .iter()
@@ -593,23 +552,37 @@ fn count_unconsumed_conflicts(
         .count()
 }
 
-/// Greedy stable matcher: best (saved, live) pair first, distinct assignment.
-/// Returns `None` for any saved window where no live candidate clears the
-/// acceptance gate ([`MatchScore::is_acceptable`]).
-///
-/// Shared by the planner and `verify` so both report the same matches.
+fn restorable_bundles(snapshot: &WorkspaceSnapshot) -> HashSet<&str> {
+    snapshot
+        .windows
+        .iter()
+        .filter(|window| restore_skip_reason(window).is_none())
+        .filter_map(|window| window.bundle_id.as_deref())
+        .collect()
+}
+
+/// Assign the highest-scoring acceptable pairs first, using each live window
+/// at most once. Shared with verification to keep their assignments consistent.
+/// Skipped windows reserve plausible geometry even when their titles changed.
 pub(crate) fn assign_matches(
     saved: &[&WindowSnapshot],
+    target_frames: &[Frame],
     live: &[&LiveWindow],
     already_consumed: &HashSet<u32>,
 ) -> Vec<Option<(usize, MatchScore)>> {
+    const PROTECTED_GEOMETRY_MIN: f32 = 0.85;
+    assert_eq!(saved.len(), target_frames.len());
+    let skipped: Vec<bool> = saved
+        .iter()
+        .map(|window| restore_skip_reason(window).is_some())
+        .collect();
     let mut pairs: Vec<(MatchScore, usize, usize)> = Vec::with_capacity(saved.len() * live.len());
     for (saved_idx, snap) in saved.iter().enumerate() {
         for (live_idx, candidate) in live.iter().enumerate() {
             if already_consumed.contains(&candidate.window_id) {
                 continue;
             }
-            let score = compute_match_score(snap, candidate);
+            let score = compute_match_score_with_target(snap, candidate, target_frames[saved_idx]);
             pairs.push((score, saved_idx, live_idx));
         }
     }
@@ -619,6 +592,8 @@ pub(crate) fn assign_matches(
             .final_score
             .partial_cmp(&left.0.final_score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            // When identity is equally plausible, protect the skipped window.
+            .then_with(|| skipped[right.1].cmp(&skipped[left.1]))
     });
 
     let mut assignments: Vec<Option<(usize, MatchScore)>> = vec![None; saved.len()];
@@ -627,7 +602,11 @@ pub(crate) fn assign_matches(
         if assignments[saved_idx].is_some() || used_live.contains(&live_idx) {
             continue;
         }
-        if !score.is_acceptable() {
+        // Reserve protected counterparts conservatively as titles and positions change.
+        let protected_geometry = skipped[saved_idx]
+            && score.bundle_match
+            && score.geometry_similarity >= PROTECTED_GEOMETRY_MIN;
+        if !score.is_acceptable() && !protected_geometry {
             continue;
         }
         assignments[saved_idx] = Some((live_idx, score));
@@ -637,6 +616,14 @@ pub(crate) fn assign_matches(
 }
 
 pub fn compute_match_score(saved: &WindowSnapshot, candidate: &LiveWindow) -> MatchScore {
+    compute_match_score_with_target(saved, candidate, saved.frame)
+}
+
+fn compute_match_score_with_target(
+    saved: &WindowSnapshot,
+    candidate: &LiveWindow,
+    target_frame: Frame,
+) -> MatchScore {
     let bundle_match = candidate
         .bundle_id
         .as_deref()
@@ -644,9 +631,12 @@ pub fn compute_match_score(saved: &WindowSnapshot, candidate: &LiveWindow) -> Ma
         .map(|(left, right)| left == right)
         .unwrap_or(false);
 
-    let title_evidence = saved.title.is_some() && candidate.title.is_some();
-    let title_similarity = title_similarity(saved.title.as_deref(), candidate.title.as_deref());
-    let geometry_similarity = geometry_similarity(saved.frame, candidate.frame);
+    let title_comparison = title_similarity(saved.title.as_deref(), candidate.title.as_deref());
+    let title_evidence = title_comparison.is_some();
+    let title_similarity = title_comparison.unwrap_or(0.0);
+    // A window can still be at its saved position or already at its remapped target.
+    let geometry_similarity = geometry_similarity(saved.frame, candidate.frame)
+        .max(geometry_similarity(target_frame, candidate.frame));
 
     // Weighted final score in [0,1] favoring title similarity once bundle
     // matches.  Bundle mismatch caps the score so cross-app reuse is unlikely.
@@ -662,25 +652,26 @@ pub fn compute_match_score(saved: &WindowSnapshot, candidate: &LiveWindow) -> Ma
     }
 }
 
-fn title_similarity(left: Option<&str>, right: Option<&str>) -> f32 {
+fn title_similarity(left: Option<&str>, right: Option<&str>) -> Option<f32> {
     match (left, right) {
-        (Some(a), Some(b)) if a == b => 1.0,
         (Some(a), Some(b)) => {
             let na = normalize_title(a);
             let nb = normalize_title(b);
-            if na == nb && !na.is_empty() {
-                return 0.95;
-            }
             if na.is_empty() || nb.is_empty() {
-                return 0.3;
+                return None;
+            }
+            if a == b {
+                return Some(1.0);
+            }
+            if na == nb {
+                return Some(0.95);
             }
             if na.contains(&nb) || nb.contains(&na) {
-                return 0.7;
+                return Some(0.7);
             }
-            jaccard_words(&na, &nb)
+            Some(jaccard_words(&na, &nb))
         }
-        (None, None) => 0.5,
-        _ => 0.3,
+        _ => None,
     }
 }
 
@@ -717,7 +708,7 @@ fn geometry_similarity(left: Frame, right: Frame) -> f32 {
     let dx = (center_left.0 - center_right.0).abs();
     let dy = (center_left.1 - center_right.1).abs();
     let distance = (dx * dx + dy * dy).sqrt();
-    // 2000px distance ~= 0 similarity.
+    // Position similarity reaches zero at 2,000 points.
     let position_score = (1.0 - (distance / 2000.0)).clamp(0.0, 1.0) as f32;
 
     let size_left = (left.width.max(1.0), left.height.max(1.0));
@@ -729,15 +720,7 @@ fn geometry_similarity(left: Frame, right: Frame) -> f32 {
     0.5 * position_score + 0.5 * size_score
 }
 
-/// Project an `app_support`-supported saved window onto a current display.
-/// Thin re-export of the shared remap logic in `world.rs`.
-pub fn target_frame_for_window(
-    window: &WindowSnapshot,
-    saved_displays: &[DisplaySnapshot],
-    current_displays: &[DisplaySnapshot],
-) -> Frame {
-    crate::world::target_frame_for_window(window, saved_displays, current_displays)
-}
+pub use crate::world::target_frame_for_window;
 
 #[cfg(test)]
 mod tests {
@@ -1161,9 +1144,7 @@ mod tests {
 
     #[test]
     fn titleless_windows_do_not_match_on_weak_geometry() {
-        // Regression: without Screen Recording permission all titles are None,
-        // and a saved window whose real window was closed used to "match" a
-        // completely different window of the same app and relocate it.
+        // Missing titles require a stricter geometry match.
         let bundle = "com.google.Chrome";
         let mut saved_window = saved(
             "ignored",
@@ -1221,7 +1202,6 @@ mod tests {
             bundle,
         );
         saved_window.title = None;
-        // Same window drifted by a few pixels (e.g. Chrome resized itself).
         let mut live_window = live(
             "ignored",
             Frame {
@@ -1274,7 +1254,4 @@ mod tests {
             .iter()
             .any(|op| matches!(op.kind, OperationKind::LaunchApp { .. })));
     }
-
-    // Force inclusion of SnapshotListEntry import even if unused to keep
-    // the test module dependency-light if model changes.
 }

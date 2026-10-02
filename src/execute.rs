@@ -1,15 +1,15 @@
-//! Execution engine for restore plans.
+//! Run restore plans and record each operation in an execution journal.
 //!
-//! The planner produces a [`RestorePlan`]; this module *executes* it against
-//! a pluggable [`Executor`]. A real-world [`MacOsExecutor`] talks to the
-//! system, and a [`SimulatedExecutor`] mutates an in-memory [`WorldState`]
-//! for deterministic testing.
-//!
-//! Every operation is recorded in an [`ExecutionJournal`] with status,
-//! timing, and a human-readable message — these journals are the audit trail
-//! for both production debugging and test assertions.
+//! The macOS executor uses retained window handles; the simulator updates an
+//! in-memory world for tests.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
+
+#[cfg(target_os = "macos")]
+use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -20,20 +20,23 @@ use crate::{
     plan::{LiveWindow, OperationKind, PlannedOperation, RestorePlan, WorldState},
 };
 
-// ---------------------------------------------------------------------------
-// Journal
-// ---------------------------------------------------------------------------
+#[cfg(target_os = "macos")]
+use crate::macos::{
+    accessibility::{self, WindowHandle},
+    app, chrome,
+    window::{self, RawWindow},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JournalStatus {
-    /// Op executed and produced the desired observable change.
+    /// The executor reported success.
     Success,
-    /// Op executed but the post-condition could not be observed.
+    /// Attempted, but the result was not fully confirmed.
     PartialSuccess,
-    /// Op was intentionally skipped (gate-skip or planner Skip).
+    /// Not attempted; see the journal message for the reason.
     Skipped,
-    /// Op was attempted but failed.
+    /// The operation failed.
     Failed,
 }
 
@@ -60,6 +63,19 @@ pub struct ExecutionJournal {
 }
 
 impl ExecutionJournal {
+    /// All planned actions succeeded; intentional planner skips are allowed.
+    pub fn succeeded(&self, plan: &RestorePlan) -> bool {
+        self.entries.len() == plan.operations.len()
+            && plan
+                .operations
+                .iter()
+                .zip(&self.entries)
+                .all(|(op, entry)| {
+                    matches!(op.kind, OperationKind::Skip { .. })
+                        || entry.status == JournalStatus::Success
+                })
+    }
+
     pub fn counts(&self) -> JournalCounts {
         let mut counts = JournalCounts::default();
         for entry in &self.entries {
@@ -82,12 +98,7 @@ pub struct JournalCounts {
     pub failed: usize,
 }
 
-// ---------------------------------------------------------------------------
-// Executor trait
-// ---------------------------------------------------------------------------
-
-/// Outcome of a single executor call. `attempts` is used by the executor to
-/// surface its internal retry budget into the journal.
+/// Executor result and attempt count, copied into the journal.
 #[derive(Debug, Clone)]
 pub struct OpOutcome {
     pub status: JournalStatus,
@@ -157,16 +168,11 @@ pub trait Executor {
     fn minimize_window(&mut self, pid: i32, window_id: u32) -> Result<OpOutcome>;
     fn close_window(&mut self, pid: i32, window_id: u32) -> Result<OpOutcome>;
 
-    /// Re-observe the world after a batch of mutations. Default: no-op for
-    /// executors that already keep their state authoritative.
+    /// Return updated observations, if the executor maintains them.
     fn observe(&mut self) -> Result<Option<WorldState>> {
         Ok(None)
     }
 }
-
-// ---------------------------------------------------------------------------
-// execute_plan
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExecuteOptions {
@@ -179,6 +185,89 @@ pub fn execute_plan<E: Executor>(
     executor: &mut E,
     options: ExecuteOptions,
 ) -> ExecutionJournal {
+    if options.dry_run {
+        return preview_plan(snapshot, plan);
+    }
+
+    // Cleanup is allowed only after every restore prerequisite for that app
+    // has succeeded. Count ahead so premature cleanup also fails closed.
+    let mut progress: HashMap<&str, AppRestoreProgress> = HashMap::new();
+    for op in &plan.operations {
+        if is_restore_operation(&op.kind) {
+            if let Some(bundle) = operation_bundle(op) {
+                progress.entry(bundle).or_default().pending += 1;
+            }
+        }
+    }
+
+    journal_plan(snapshot, plan, |op| {
+        let bundle = operation_bundle(op);
+        let app = bundle.and_then(|bundle| progress.get(bundle));
+        let cleanup = matches!(
+            op.kind,
+            OperationKind::MinimizeConflict { .. } | OperationKind::CloseConflict { .. }
+        );
+        let outcome = if cleanup && !app.is_some_and(|app| app.pending == 0 && !app.unconfirmed) {
+            OpOutcome::skipped("cleanup skipped: restore prerequisites are not confirmed")
+        } else if is_restore_operation(&op.kind) && app.is_some_and(|app| app.launch_unconfirmed) {
+            OpOutcome::skipped("restore skipped: app launch was not confirmed")
+        } else {
+            run_op(executor, snapshot, op)
+        };
+
+        if is_restore_operation(&op.kind) {
+            if let Some(app) = bundle.and_then(|bundle| progress.get_mut(bundle)) {
+                app.pending -= 1;
+                if outcome.status != JournalStatus::Success {
+                    app.unconfirmed = true;
+                    if matches!(op.kind, OperationKind::LaunchApp { .. }) {
+                        app.launch_unconfirmed = true;
+                    }
+                }
+            }
+        }
+        outcome
+    })
+}
+
+#[derive(Default)]
+struct AppRestoreProgress {
+    pending: usize,
+    unconfirmed: bool,
+    launch_unconfirmed: bool,
+}
+
+fn is_restore_operation(kind: &OperationKind) -> bool {
+    matches!(
+        kind,
+        OperationKind::LaunchApp { .. }
+            | OperationKind::CreateWindow { .. }
+            | OperationKind::Reposition { .. }
+            | OperationKind::RestoreChromeTabs { .. }
+    )
+}
+
+fn operation_bundle(op: &PlannedOperation) -> Option<&str> {
+    match &op.kind {
+        OperationKind::LaunchApp { bundle_id }
+        | OperationKind::CreateWindow { bundle_id, .. }
+        | OperationKind::RestoreChromeTabs { bundle_id, .. } => Some(bundle_id),
+        _ => op.bundle_id.as_deref(),
+    }
+}
+
+/// Describe a plan without constructing or calling an executor.
+pub fn preview_plan(snapshot: &WorkspaceSnapshot, plan: &RestorePlan) -> ExecutionJournal {
+    journal_plan(snapshot, plan, |op| {
+        OpOutcome::skipped(format!("dry-run: would {}", describe(op)))
+    })
+}
+
+fn journal_plan(
+    snapshot: &WorkspaceSnapshot,
+    plan: &RestorePlan,
+    mut outcome_for: impl FnMut(&PlannedOperation) -> OpOutcome,
+) -> ExecutionJournal {
     let started_at = Utc::now();
     let start = Instant::now();
     let mut entries = Vec::with_capacity(plan.operations.len());
@@ -186,15 +275,7 @@ pub fn execute_plan<E: Executor>(
     for (index, op) in plan.operations.iter().enumerate() {
         let op_start = Instant::now();
         let op_started_at = Utc::now();
-        let outcome = if options.dry_run {
-            OpOutcome {
-                status: JournalStatus::Skipped,
-                message: format!("dry-run: would {}", describe(op)),
-                attempts: 0,
-            }
-        } else {
-            run_op(executor, snapshot, op)
-        };
+        let outcome = outcome_for(op);
 
         entries.push(JournalEntry {
             op_index: index,
@@ -294,9 +375,8 @@ fn run_op<E: Executor>(
             bundle_id,
             target_frame,
         } => {
-            // One op restores exactly one saved Chrome window at its
-            // display-remapped target frame. Restoring the whole bundle here
-            // would rewrite tabs of live windows other ops already matched.
+            // Keep browser restoration scoped to this saved window; other
+            // operations may already have claimed windows from the same app.
             let saved = match saved_for_op(snapshot, op) {
                 Ok(saved) => saved,
                 Err(outcome) => return outcome,
@@ -323,12 +403,7 @@ fn run_op<E: Executor>(
     }
 }
 
-// ---------------------------------------------------------------------------
-// SimulatedExecutor — pure, in-memory, for tests
-// ---------------------------------------------------------------------------
-
-/// In-memory executor that mutates a [`WorldState`] in place. Used to drive
-/// the engine in tests without touching any OS APIs.
+/// Test executor backed by an in-memory world.
 pub struct SimulatedExecutor {
     pub world: WorldState,
     pub next_window_id: u32,
@@ -341,8 +416,23 @@ pub struct SimulatedExecutor {
 
 impl SimulatedExecutor {
     pub fn new(world: WorldState) -> Self {
-        let next_window_id = world.windows.iter().map(|w| w.window_id).max().unwrap_or(0) + 1;
-        let next_pid = world.windows.iter().map(|w| w.pid).max().unwrap_or(100) + 1;
+        let next_window_id = world
+            .windows
+            .iter()
+            .map(|w| w.window_id)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .unwrap_or(1);
+        let next_pid = world
+            .windows
+            .iter()
+            .map(|w| w.pid)
+            .chain(world.running_pids.values().flatten().copied())
+            .max()
+            .unwrap_or(100)
+            .checked_add(1)
+            .unwrap_or(1);
         Self {
             world,
             next_window_id,
@@ -360,15 +450,35 @@ impl SimulatedExecutor {
     }
 
     fn alloc_pid(&mut self) -> i32 {
-        let pid = self.next_pid;
-        self.next_pid += 1;
-        pid
+        loop {
+            let pid = self.next_pid.max(1);
+            self.next_pid = pid.checked_add(1).unwrap_or(1);
+            if !self.world.windows.iter().any(|window| window.pid == pid)
+                && !self
+                    .world
+                    .running_pids
+                    .values()
+                    .flatten()
+                    .any(|p| *p == pid)
+            {
+                return pid;
+            }
+        }
     }
 
     fn alloc_window_id(&mut self) -> u32 {
-        let id = self.next_window_id;
-        self.next_window_id += 1;
-        id
+        loop {
+            let id = self.next_window_id.max(1);
+            self.next_window_id = id.checked_add(1).unwrap_or(1);
+            if !self
+                .world
+                .windows
+                .iter()
+                .any(|window| window.window_id == id)
+            {
+                return id;
+            }
+        }
     }
 }
 
@@ -470,8 +580,6 @@ impl Executor for SimulatedExecutor {
         bundle_id: &str,
         windows: &[(&WindowSnapshot, Frame)],
     ) -> Result<OpOutcome> {
-        // Mirror the real semantics: create new windows at their target
-        // frames without touching any existing live windows.
         let pid = self
             .world
             .pids_for(bundle_id)
@@ -531,22 +639,18 @@ impl Executor for SimulatedExecutor {
     }
 }
 
-// ---------------------------------------------------------------------------
-// MacOsExecutor (real-world)
-// ---------------------------------------------------------------------------
-
-/// A real-world [`Executor`] that drives the macOS Accessibility / NSWorkspace
-/// stack. It needs an up-to-date [`WorldState`] (typically the planner's
-/// `observed_world`) so it can map `(pid, window_id)` pairs back to the
-/// AX-visible title and frame required for window matching.
+/// macOS executor. Window identities are resolved before mutation and retained
+/// for movement, cleanup, and stacking order.
 #[cfg(target_os = "macos")]
 pub struct MacOsExecutor {
     world: WorldState,
-    /// Windows that appeared when this run launched an app and have not yet
-    /// been claimed by a CreateWindow op. Launching an app usually opens one
-    /// or more windows on its own (VS Code restores whole workspaces);
-    /// CreateWindow ops adopt these instead of stacking extra windows on top.
-    adoptable_windows: std::collections::HashMap<String, Vec<u32>>,
+    /// Unclaimed windows opened during launch. Creating a window consumes
+    /// these first, since apps often open a window on their own.
+    adoptable_windows: HashMap<String, Vec<u32>>,
+    window_handles: HashMap<(i32, u32), WindowHandle>,
+    known_handles: Vec<WindowHandle>,
+    browser_window_ids: HashMap<(i32, u32), i64>,
+    restored_windows: HashMap<u32, (String, WindowHandle)>,
 }
 
 #[cfg(target_os = "macos")]
@@ -561,20 +665,111 @@ const WINDOW_WAIT_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(target_os = "macos")]
 impl MacOsExecutor {
     pub fn new(world: WorldState) -> Self {
-        Self {
+        let mut executor = Self {
             world,
-            adoptable_windows: std::collections::HashMap::new(),
+            adoptable_windows: HashMap::new(),
+            window_handles: HashMap::new(),
+            known_handles: Vec::new(),
+            browser_window_ids: HashMap::new(),
+            restored_windows: HashMap::new(),
+        };
+        executor.bind_observed_windows();
+        executor
+    }
+
+    fn bind_observed_windows(&mut self) {
+        let mut by_pid: HashMap<i32, Vec<&LiveWindow>> = HashMap::new();
+        let mut by_browser: HashMap<&str, Vec<&LiveWindow>> = HashMap::new();
+        for live in &self.world.windows {
+            let observed = Self::synthetic_snapshot(live);
+            if crate::plan::restore_skip_reason(&observed).is_some() {
+                continue;
+            }
+            by_pid.entry(live.pid).or_default().push(live);
+            if crate::app_support::is_tab_capable(live.bundle_id.as_deref()) {
+                if let Some(bundle) = live.bundle_id.as_deref() {
+                    by_browser.entry(bundle).or_default().push(live);
+                }
+            }
+        }
+        for (pid, live) in by_pid {
+            if let Ok(handles) = accessibility::window_handles(pid) {
+                self.known_handles.extend(handles);
+            }
+            let observed: Vec<_> = live
+                .iter()
+                .map(|window| Self::synthetic_snapshot(window))
+                .collect();
+            match accessibility::resolve_windows(pid, &observed) {
+                Ok(handles) => {
+                    for (window, handle) in live.into_iter().zip(handles) {
+                        if let Some(handle) = handle {
+                            self.window_handles.insert((pid, window.window_id), handle);
+                        }
+                    }
+                }
+                Err(error) => tracing::debug!(pid, %error, "AX window identity lookup failed"),
+            }
+        }
+        for (bundle, live) in by_browser {
+            let observed: Vec<_> = live
+                .iter()
+                .map(|window| Self::synthetic_snapshot(window))
+                .collect();
+            match chrome::resolve_window_ids(bundle, &observed) {
+                Ok(ids) => {
+                    for (window, id) in live.into_iter().zip(ids) {
+                        if let Some(id) = id {
+                            self.browser_window_ids
+                                .insert((window.pid, window.window_id), id);
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(bundle, %error, "browser window identity lookup failed")
+                }
+            }
         }
     }
 
-    /// System Events names processes by their displayed app name ("Code",
-    /// "Google Chrome"), not the executable name captured in snapshots
-    /// ("Electron"). Resolve it from the running app; fall back to the saved
-    /// process name.
+    fn remember_restored(&mut self, saved: &WindowSnapshot, handle: WindowHandle) {
+        if let Some(bundle) = &saved.bundle_id {
+            self.restored_windows
+                .insert(saved.window_id, (bundle.clone(), handle));
+        }
+    }
+
+    /// Raise only windows this executor actually restored, using the same
+    /// retained handles. Disappeared windows never select a replacement.
+    pub fn replay_z_order(&self, snapshot: &WorkspaceSnapshot) {
+        let mut windows: Vec<_> = snapshot.windows.iter().collect();
+        windows.sort_by_key(|window| std::cmp::Reverse(window.z_order.unwrap_or(u32::MAX)));
+        for saved in windows {
+            if crate::plan::restore_skip_reason(saved).is_some()
+                || snapshot
+                    .windows
+                    .iter()
+                    .filter(|window| window.window_id == saved.window_id)
+                    .count()
+                    != 1
+            {
+                continue;
+            }
+            if let Some((bundle, handle)) = self.restored_windows.get(&saved.window_id) {
+                let _ = app::activate_bundle(bundle);
+                if let Err(error) = handle.raise() {
+                    tracing::debug!(%error, "raising restored window failed");
+                }
+            }
+        }
+    }
+
+    /// System Events uses display names such as "Code", while captured
+    /// process names can be "Electron".
     fn system_events_process_name(bundle_id: &str, fallback: &str) -> String {
-        crate::macos::app::running_pids_for_bundle(bundle_id)
+        app::running_pids_for_bundle(bundle_id)
             .first()
-            .and_then(|pid| crate::macos::app::application_for_pid(*pid))
+            .and_then(|pid| app::application_for_pid(*pid))
             .and_then(|info| info.localized_name)
             .unwrap_or_else(|| fallback.to_string())
     }
@@ -586,8 +781,7 @@ impl MacOsExecutor {
             .find(|w| w.pid == pid && w.window_id == window_id)
     }
 
-    /// Build a synthetic `WindowSnapshot` whose title + frame fields match a
-    /// live window. Only those two fields are consulted by the AX matcher.
+    /// Adapt live observations to the AX resolver's snapshot input.
     fn synthetic_snapshot(live: &LiveWindow) -> WindowSnapshot {
         WindowSnapshot {
             window_id: live.window_id,
@@ -608,16 +802,15 @@ impl MacOsExecutor {
         }
     }
 
-    /// Current CG windows belonging to a bundle, front-to-back, junk filtered.
-    fn cg_windows_for_bundle(bundle_id: &str) -> Vec<crate::macos::window::RawWindow> {
-        let pids: std::collections::HashSet<i32> =
-            crate::macos::app::running_pids_for_bundle(bundle_id)
-                .into_iter()
-                .collect();
+    /// Capturable CG windows for this app, in front-to-back order.
+    fn cg_windows_for_bundle(bundle_id: &str) -> Vec<RawWindow> {
+        let pids: HashSet<i32> = app::running_pids_for_bundle(bundle_id)
+            .into_iter()
+            .collect();
         if pids.is_empty() {
             return Vec::new();
         }
-        crate::macos::window::enumerate_windows()
+        window::enumerate_windows()
             .unwrap_or_default()
             .into_iter()
             .filter(|raw| pids.contains(&raw.owner_pid))
@@ -625,7 +818,7 @@ impl MacOsExecutor {
             .collect()
     }
 
-    fn wait_for_any_window(bundle_id: &str) -> Option<crate::macos::window::RawWindow> {
+    fn wait_for_any_window(bundle_id: &str) -> Option<RawWindow> {
         for attempt in 0..WINDOW_WAIT_ATTEMPTS {
             let mut windows = Self::cg_windows_for_bundle(bundle_id);
             if !windows.is_empty() {
@@ -639,10 +832,12 @@ impl MacOsExecutor {
     }
 
     /// Move a specific CG window (identified before/after Cmd+N) to `target`
-    /// by matching its live title + frame through the AX matcher.
+    /// by resolving its observed live state once and retaining its handle.
     fn position_raw_window(
+        &mut self,
         bundle_id: &str,
-        raw: &crate::macos::window::RawWindow,
+        raw: &RawWindow,
+        saved: &WindowSnapshot,
         target: Frame,
         verb: &str,
     ) -> OpOutcome {
@@ -656,29 +851,70 @@ impl MacOsExecutor {
             minimized: false,
         };
         let synthetic = Self::synthetic_snapshot(&live);
-        match crate::macos::accessibility::set_window_frame(raw.owner_pid, &synthetic, target) {
-            Ok(true) => OpOutcome::success(format!("{verb} and positioned")),
-            Ok(false) => OpOutcome::partial(format!("{verb}; AX could not match it to position")),
+        let handle = match accessibility::resolve_window(raw.owner_pid, &synthetic) {
+            Ok(Some(handle)) => handle,
+            Ok(None) => {
+                return OpOutcome::partial(format!("{verb}; AX identity is missing or ambiguous"))
+            }
+            Err(error) => return OpOutcome::partial(format!("{verb}; AX lookup failed: {error}")),
+        };
+        if self.handle_is_known(&handle) {
+            return OpOutcome::partial(format!(
+                "{verb}; AX identity belongs to an existing window"
+            ));
+        }
+        match handle.set_frame(target) {
+            Ok(true) => {
+                self.remember_restored(saved, handle);
+                OpOutcome::success(format!("{verb} and positioned"))
+            }
+            Ok(false) => OpOutcome::partial(format!("{verb}; position could not be verified")),
             Err(e) => OpOutcome::partial(format!("{verb}; positioning failed: {e}")),
         }
+    }
+
+    fn handle_is_known(&self, handle: &WindowHandle) -> bool {
+        self.known_handles
+            .iter()
+            .any(|known| known.same_window(handle))
+            || self
+                .window_handles
+                .values()
+                .any(|known| known.same_window(handle))
+            || self
+                .restored_windows
+                .values()
+                .any(|(_, known)| known.same_window(handle))
+    }
+
+    fn remember_existing_handles(&mut self, bundle_id: &str) -> Result<()> {
+        for pid in app::running_pids_for_bundle(bundle_id) {
+            self.known_handles
+                .extend(accessibility::window_handles(pid)?);
+        }
+        Ok(())
     }
 }
 
 #[cfg(target_os = "macos")]
 impl Executor for MacOsExecutor {
     fn launch_app(&mut self, bundle_id: &str) -> Result<OpOutcome> {
-        match crate::macos::app::launch_bundle(bundle_id) {
+        self.remember_existing_handles(bundle_id)?;
+        let before: HashSet<_> = Self::cg_windows_for_bundle(bundle_id)
+            .into_iter()
+            .map(|window| window.window_id)
+            .collect();
+        match app::launch_bundle(bundle_id) {
             Ok(true) => {}
             Ok(false) => return Ok(OpOutcome::failed(format!("launch refused for {bundle_id}"))),
             Err(e) => return Ok(OpOutcome::failed(e.to_string())),
         }
 
-        // Wait for the process to register with NSWorkspace so the ops that
-        // follow (create/reposition) have something to act on.
+        // NSWorkspace can register the process after the launch call returns.
         let mut attempts = 1u32;
         let mut running = false;
         for attempt in 0..LAUNCH_WAIT_ATTEMPTS {
-            if !crate::macos::app::running_pids_for_bundle(bundle_id).is_empty() {
+            if !app::running_pids_for_bundle(bundle_id).is_empty() {
                 running = true;
                 break;
             }
@@ -694,11 +930,11 @@ impl Executor for MacOsExecutor {
             .with_attempts(attempts));
         }
 
-        // Best-effort: wait for its first window, then record every window
-        // the launch produced so CreateWindow ops can adopt them.
+        // Keep launch-created windows available for subsequent create ops.
         let has_window = Self::wait_for_any_window(bundle_id).is_some();
         let adoptable: Vec<u32> = Self::cg_windows_for_bundle(bundle_id)
             .iter()
+            .filter(|raw| !before.contains(&raw.window_id))
             .map(|raw| raw.window_id)
             .collect();
         self.adoptable_windows
@@ -719,31 +955,30 @@ impl Executor for MacOsExecutor {
         saved: &WindowSnapshot,
         target: Frame,
     ) -> Result<OpOutcome> {
-        // Adopt a window the app opened at launch instead of opening another
-        // one on top of it; only Cmd+N once the launch pool is exhausted.
-        if let Some(pool) = self.adoptable_windows.get_mut(bundle_id) {
-            while let Some(window_id) = pool.pop() {
-                if let Some(raw) = Self::cg_windows_for_bundle(bundle_id)
-                    .into_iter()
-                    .find(|raw| raw.window_id == window_id)
-                {
-                    return Ok(Self::position_raw_window(
-                        bundle_id,
-                        &raw,
-                        target,
-                        "adopted launch window",
-                    ));
-                }
+        while let Some(window_id) = self.adoptable_windows.get_mut(bundle_id).and_then(Vec::pop) {
+            if let Some(raw) = Self::cg_windows_for_bundle(bundle_id)
+                .into_iter()
+                .find(|raw| raw.window_id == window_id)
+            {
+                return Ok(self.position_raw_window(
+                    bundle_id,
+                    &raw,
+                    saved,
+                    target,
+                    "adopted launch window",
+                ));
             }
         }
 
-        let before: std::collections::HashSet<u32> = Self::cg_windows_for_bundle(bundle_id)
+        let before: HashSet<u32> = Self::cg_windows_for_bundle(bundle_id)
             .iter()
             .map(|raw| raw.window_id)
             .collect();
 
+        self.remember_existing_handles(bundle_id)?;
+
         let process_name = Self::system_events_process_name(bundle_id, &saved.process_name);
-        match crate::macos::app::create_new_window(bundle_id, &process_name) {
+        match app::create_new_window(bundle_id, &process_name) {
             Ok(true) => {}
             Ok(false) => {
                 return Ok(OpOutcome::failed(format!(
@@ -753,14 +988,20 @@ impl Executor for MacOsExecutor {
             Err(e) => return Ok(OpOutcome::failed(e.to_string())),
         }
 
-        // Identify the new window by diffing CG window ids, then position it.
         let mut attempts = 1u32;
         let mut created = None;
         for attempt in 0..WINDOW_WAIT_ATTEMPTS {
-            if let Some(raw) = Self::cg_windows_for_bundle(bundle_id)
+            let mut added: Vec<_> = Self::cg_windows_for_bundle(bundle_id)
                 .into_iter()
-                .find(|raw| !before.contains(&raw.window_id))
-            {
+                .filter(|raw| !before.contains(&raw.window_id))
+                .collect();
+            if added.len() > 1 {
+                return Ok(OpOutcome::partial(
+                    "multiple new windows appeared; creation ownership is ambiguous",
+                )
+                .with_attempts(attempts));
+            }
+            if let Some(raw) = added.pop() {
                 created = Some(raw);
                 break;
             }
@@ -771,10 +1012,9 @@ impl Executor for MacOsExecutor {
         }
 
         match created {
-            Some(raw) => Ok(
-                Self::position_raw_window(bundle_id, &raw, target, "created window")
-                    .with_attempts(attempts),
-            ),
+            Some(raw) => Ok(self
+                .position_raw_window(bundle_id, &raw, saved, target, "created window")
+                .with_attempts(attempts)),
             None => Ok(OpOutcome::partial(format!(
                 "asked {bundle_id} (process {process_name}) for a new window but none appeared"
             ))
@@ -789,43 +1029,59 @@ impl Executor for MacOsExecutor {
         saved: &WindowSnapshot,
         target: Frame,
     ) -> Result<OpOutcome> {
-        // A minimized window can be AX-matched and "moved", but stays in the
-        // Dock. Un-minimize it first so the reposition is actually visible.
-        let live_frame = self.find_live(pid, window_id).map(|live| {
-            if live.minimized {
-                let synthetic = Self::synthetic_snapshot(live);
-                let _ = crate::macos::accessibility::unminimize_window(pid, &synthetic);
-            }
-            live.frame
-        });
-
+        let Some(live) = self.find_live(pid, window_id).cloned() else {
+            return Ok(OpOutcome::failed("planned live window is missing"));
+        };
+        if live.bundle_id != saved.bundle_id {
+            return Ok(OpOutcome::failed(
+                "planned live window belongs to a different app",
+            ));
+        }
+        let Some(handle) = self.window_handles.get(&(pid, window_id)).cloned() else {
+            return Ok(OpOutcome::skipped(
+                "planned AX identity is missing or ambiguous",
+            ));
+        };
+        if handle.is_fullscreen() {
+            return Ok(OpOutcome::skipped(
+                "planned window entered fullscreen; leaving it alone",
+            ));
+        }
         let tab_capable = crate::app_support::is_tab_capable(saved.bundle_id.as_deref());
         let bundle_id = saved.bundle_id.as_deref().unwrap_or_default();
-
-        // Chromium's AX implementation intermittently rejects AXSize writes
-        // (kAXErrorFailure -25200); scripting `bounds` is deterministic, so
-        // prefer it for tab-capable browsers and fall back to AX.
-        let positioned = if tab_capable {
-            let from = live_frame.unwrap_or(saved.frame);
-            match crate::macos::chrome::set_window_bounds(bundle_id, from, target) {
-                Ok(true) => Ok(true),
-                Ok(false) | Err(_) => {
-                    crate::macos::accessibility::set_window_frame(pid, saved, target)
+        let browser_id = self.browser_window_ids.get(&(pid, window_id)).copied();
+        if tab_capable && browser_id.is_none() {
+            return Ok(OpOutcome::skipped(
+                "planned browser identity is missing or ambiguous",
+            ));
+        }
+        if live.minimized {
+            match handle.set_minimized(false) {
+                Ok(true) => {}
+                Ok(false) => return Ok(OpOutcome::partial("unminimizing could not be verified")),
+                Err(error) => {
+                    return Ok(OpOutcome::failed(format!("unminimizing failed: {error}")))
                 }
             }
+        }
+
+        // Chromium can reject AXSize writes with -25200. Prefer scripting
+        // bounds, with AX as a fallback on the same retained window.
+        let positioned = if let Some(browser_id) = browser_id {
+            match chrome::set_window_bounds(bundle_id, browser_id, target) {
+                Ok(true) => Ok(true),
+                Ok(false) | Err(_) => handle.set_frame(target),
+            }
         } else {
-            crate::macos::accessibility::set_window_frame(pid, saved, target)
+            handle.set_frame(target)
         };
 
         match positioned {
             Ok(true) => {
-                // A matched browser window keeps its identity, but the user
-                // may have closed some of its saved tabs — re-open the missing
-                // ones (add-only; nothing the user has open is touched).
-                if tab_capable && !saved.browser_tabs.is_empty() {
+                self.remember_restored(saved, handle);
+                if let Some(browser_id) = browser_id.filter(|_| !saved.browser_tabs.is_empty()) {
                     return Ok(
-                        match crate::macos::chrome::reconcile_window_tabs(bundle_id, saved, target)
-                        {
+                        match chrome::reconcile_window_tabs(bundle_id, browser_id, saved) {
                             Ok(Some(0)) => OpOutcome::success("repositioned".to_string()),
                             Ok(Some(n)) => OpOutcome::success(format!(
                                 "repositioned; reopened {n} missing tab(s)"
@@ -842,7 +1098,9 @@ impl Executor for MacOsExecutor {
                 }
                 Ok(OpOutcome::success("repositioned".to_string()))
             }
-            Ok(false) => Ok(OpOutcome::partial("AX match failed".to_string())),
+            Ok(false) => Ok(OpOutcome::partial(
+                "position could not be verified".to_string(),
+            )),
             Err(e) => Ok(OpOutcome::failed(e.to_string())),
         }
     }
@@ -852,26 +1110,53 @@ impl Executor for MacOsExecutor {
         bundle_id: &str,
         windows: &[(&WindowSnapshot, Frame)],
     ) -> Result<OpOutcome> {
-        match crate::macos::chrome::restore_windows(bundle_id, windows) {
-            Ok(true) => Ok(OpOutcome::success(format!(
-                "restored {} browser window(s)",
-                windows.len()
-            ))),
-            Ok(false) => Ok(OpOutcome::partial(
-                "chrome restore completed with per-window errors".to_string(),
-            )),
+        self.remember_existing_handles(bundle_id)?;
+        match chrome::restore_windows(bundle_id, windows) {
+            Ok(result) => {
+                for ((saved, _), restored) in windows.iter().zip(&result.windows) {
+                    let Some(restored) = restored else {
+                        continue;
+                    };
+                    let mut observed = (*saved).clone();
+                    observed.title = restored.title.clone();
+                    observed.frame = restored.frame;
+                    observed.minimized = false;
+                    let handles: Vec<_> = app::running_pids_for_bundle(bundle_id)
+                        .into_iter()
+                        .filter_map(|pid| {
+                            accessibility::resolve_window(pid, &observed).ok().flatten()
+                        })
+                        .collect();
+                    if handles.len() == 1 {
+                        let handle = handles.into_iter().next().unwrap();
+                        if !self.handle_is_known(&handle) {
+                            self.remember_restored(saved, handle);
+                        }
+                    }
+                }
+                if result.errors.is_empty() && result.windows.iter().all(Option::is_some) {
+                    Ok(OpOutcome::success(format!(
+                        "restored {} browser window(s)",
+                        windows.len()
+                    )))
+                } else {
+                    Ok(OpOutcome::partial(format!(
+                        "browser restore incomplete: {}",
+                        result.errors.join("; ")
+                    )))
+                }
+            }
             Err(e) => Ok(OpOutcome::failed(e.to_string())),
         }
     }
 
     fn minimize_window(&mut self, pid: i32, window_id: u32) -> Result<OpOutcome> {
-        let Some(live) = self.find_live(pid, window_id) else {
-            return Ok(OpOutcome::failed(
-                "no cached live window for (pid, window_id)",
+        let Some(handle) = self.window_handles.get(&(pid, window_id)) else {
+            return Ok(OpOutcome::skipped(
+                "conflict AX identity is missing or ambiguous",
             ));
         };
-        let saved = Self::synthetic_snapshot(live);
-        match crate::macos::accessibility::minimize_window(pid, &saved) {
+        match handle.set_minimized(true) {
             Ok(true) => Ok(OpOutcome::success("minimized".to_string())),
             Ok(false) => Ok(OpOutcome::partial("AX match failed".to_string())),
             Err(e) => Ok(OpOutcome::failed(e.to_string())),
@@ -879,30 +1164,21 @@ impl Executor for MacOsExecutor {
     }
 
     fn close_window(&mut self, pid: i32, window_id: u32) -> Result<OpOutcome> {
-        let Some(live) = self.find_live(pid, window_id) else {
-            return Ok(OpOutcome::failed(
-                "no cached live window for (pid, window_id)",
+        let Some(handle) = self.window_handles.get(&(pid, window_id)) else {
+            return Ok(OpOutcome::skipped(
+                "conflict AX identity is missing or ambiguous",
             ));
         };
-        let saved = Self::synthetic_snapshot(live);
-        match crate::macos::accessibility::close_window(pid, &saved) {
+        match handle.close() {
             Ok(true) => Ok(OpOutcome::success("closed".to_string())),
             Ok(false) => Ok(OpOutcome::partial("AX match failed".to_string())),
             Err(e) => Ok(OpOutcome::failed(e.to_string())),
         }
     }
-
-    fn observe(&mut self) -> Result<Option<WorldState>> {
-        // The caller should re-run `plan::observe_world` to refresh between
-        // convergence iterations; we don't re-enumerate here.
-        Ok(None)
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use chrono::Utc;
 
     use super::*;
@@ -961,12 +1237,65 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn unbound_native_executor(world: WorldState) -> MacOsExecutor {
+        // No OS queries or native handles: test the real executor's gates.
+        MacOsExecutor {
+            world,
+            adoptable_windows: HashMap::new(),
+            window_handles: HashMap::new(),
+            known_handles: Vec::new(),
+            browser_window_ids: HashMap::new(),
+            restored_windows: HashMap::new(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_executor_never_reselects_a_missing_planned_identity() {
+        let saved = saved("com.google.Chrome", "tab", frame(0.0, 0.0));
+        let live = LiveWindow {
+            bundle_id: saved.bundle_id.clone(),
+            app_name: saved.app_name.clone(),
+            pid: 1234,
+            window_id: 2,
+            title: saved.title.clone(),
+            frame: saved.frame,
+            minimized: false,
+        };
+        let mut exec = unbound_native_executor(WorldState {
+            windows: vec![live],
+            ..empty_world()
+        });
+        let missing = exec
+            .reposition(1234, 999, &saved, frame(40.0, 0.0))
+            .unwrap();
+        assert_eq!(missing.status, JournalStatus::Failed);
+        let ambiguous = exec.reposition(1234, 2, &saved, frame(40.0, 0.0)).unwrap();
+        assert_eq!(ambiguous.status, JournalStatus::Skipped);
+        assert_eq!(ambiguous.attempts, 0);
+        assert!(exec.restored_windows.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_cleanup_without_a_retained_identity_is_skipped() {
+        let mut exec = unbound_native_executor(empty_world());
+        for outcome in [
+            exec.minimize_window(1234, 2).unwrap(),
+            exec.close_window(1234, 2).unwrap(),
+        ] {
+            assert_eq!(outcome.status, JournalStatus::Skipped);
+            assert_eq!(outcome.attempts, 0);
+        }
+    }
+
     #[test]
     fn simulated_executor_launches_and_repositions_to_match_snapshot() {
         let bundle = "com.apple.Terminal";
         let snap = snapshot(vec![saved(bundle, "main", frame(100.0, 200.0))]);
         let mut exec = SimulatedExecutor::new(empty_world());
-        // Disable "launch creates window" so the planner emits a CreateWindow.
+        // Exercise creation separately from launch-window adoption.
         exec.launch_creates_window = false;
 
         let plan = plan_restore(
@@ -983,7 +1312,6 @@ mod tests {
 
         let counts = journal.counts();
         assert_eq!(counts.failed, 0, "no ops should fail: {journal:?}");
-        // The world should now contain exactly one Terminal window at the target.
         let live: Vec<_> = exec
             .world
             .windows
@@ -997,9 +1325,6 @@ mod tests {
 
     #[test]
     fn replanning_after_executor_drift_converges() {
-        // Reposition with a small drift; running plan+execute repeatedly
-        // should still converge (the second iteration picks up the moved
-        // window and re-issues a reposition to the exact target).
         let bundle = "com.apple.Terminal";
         let snap = snapshot(vec![saved(bundle, "main", frame(0.0, 0.0))]);
         let mut world = empty_world();
@@ -1115,8 +1440,6 @@ mod tests {
         let journal = execute_plan(&snap, &plan, &mut exec, ExecuteOptions::default());
         assert_eq!(journal.counts().failed, 0, "{journal:?}");
 
-        // The matched live window survives (same id) and exactly two new
-        // windows appear — nothing gets rebuilt or clobbered.
         let chrome_windows: Vec<_> = exec
             .world
             .windows
@@ -1167,7 +1490,6 @@ mod tests {
         );
         execute_plan(&snap, &plan, &mut exec, ExecuteOptions::default());
 
-        // After destructive execution only the matched window remains.
         let terminal_windows: Vec<_> = exec
             .world
             .windows

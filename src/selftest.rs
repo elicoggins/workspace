@@ -1,10 +1,4 @@
-//! End-to-end self-checks against the real machine.
-//!
-//! The unit-test suite drives `SimulatedExecutor`, so it can never prove the
-//! real macOS paths work — that gap is exactly where past bugs hid. This
-//! module exercises the live stack: observation, capture, planning, verify,
-//! and (with `--live`) an actual AX move-and-restore through
-//! `MacOsExecutor`.
+//! Checks against the current desktop. Moving windows requires `--live`.
 
 use serde::{Deserialize, Serialize};
 
@@ -36,13 +30,11 @@ impl SelftestReport {
     }
 }
 
-/// Run the self-checks. `live` additionally moves one real window by 40 px
-/// through the real executor and restores it — opt-in because it mutates the
-/// user's desktop.
+/// Check capture, planning, and verification. With `live`, also move a window
+/// and restore the snapshot.
 pub fn run(live: bool) -> Result<SelftestReport> {
     let mut report = SelftestReport::default();
 
-    // Environment.
     let doctor = world::doctor()?;
     report.check(
         "data dir writable",
@@ -64,7 +56,6 @@ pub fn run(live: bool) -> Result<SelftestReport> {
         format!("{} display(s)", doctor.display_count),
     );
 
-    // Observation.
     let world_state = world::observe_world()?;
     report.check(
         "world observation",
@@ -72,7 +63,6 @@ pub fn run(live: bool) -> Result<SelftestReport> {
         format!("{} live window(s)", world_state.windows.len()),
     );
 
-    // Capture + snapshot JSON round-trip.
     let snapshot = capture::capture_workspace("selftest")?;
     report.check(
         "capture",
@@ -90,8 +80,7 @@ pub fn run(live: bool) -> Result<SelftestReport> {
         "serialize → parse → equal",
     );
 
-    // Plan + verify against the unchanged world: a snapshot taken seconds ago
-    // must verify at ~100% or observation/matching is broken.
+    // A fresh capture should match unless the desktop changed in the meantime.
     let plan = world::build_plan(&snapshot, RestoreMode::Safe, false)?;
     report.check(
         "plan builds",
@@ -100,8 +89,8 @@ pub fn run(live: bool) -> Result<SelftestReport> {
     );
     let verify = world::verify_workspace(&snapshot)?;
     report.check(
-        "fresh snapshot verifies at ~100%",
-        verify.accuracy >= 0.99,
+        "fresh snapshot matches the current layout",
+        verify.converged,
         format!(
             "accuracy {:.1}% ({}/{} restorable)",
             verify.accuracy * 100.0,
@@ -127,7 +116,8 @@ fn run_live_check(report: &mut SelftestReport, snapshot: &WorkspaceSnapshot) -> 
 
     crate::macos::accessibility::ensure_trusted()?;
 
-    let plan = world::build_plan(snapshot, RestoreMode::Safe, false)?;
+    let observed = world::observe_world()?;
+    let plan = world::plan_for_world(snapshot, &observed, RestoreMode::Safe, false);
     let Some((saved_index, live_pid, live_window_id, target_frame)) =
         plan.operations.iter().find_map(|op| match &op.kind {
             OperationKind::Reposition {
@@ -149,12 +139,11 @@ fn run_live_check(report: &mut SelftestReport, snapshot: &WorkspaceSnapshot) -> 
     };
     let saved = &snapshot.windows[saved_index];
 
-    // Move one window 40px right through the REAL executor…
     let shifted = Frame {
         x: target_frame.x + 40.0,
         ..target_frame
     };
-    let mut executor = MacOsExecutor::new(world::observe_world()?);
+    let mut executor = MacOsExecutor::new(observed);
     let outcome = executor.reposition(live_pid, live_window_id, saved, shifted)?;
     thread::sleep(Duration::from_millis(300));
     let after = world::observe_world()?;
@@ -169,9 +158,9 @@ fn run_live_check(report: &mut SelftestReport, snapshot: &WorkspaceSnapshot) -> 
         format!("{} ({})", saved.app_name, outcome.message),
     );
 
-    // …then restore the snapshot to put it back, and verify.
-    let plan_back = world::build_plan(snapshot, RestoreMode::Safe, false)?;
-    let mut executor = MacOsExecutor::new(world::observe_world()?);
+    let observed_back = world::observe_world()?;
+    let plan_back = world::plan_for_world(snapshot, &observed_back, RestoreMode::Safe, false);
+    let mut executor = MacOsExecutor::new(observed_back);
     let journal = execute_plan(
         snapshot,
         &plan_back,
@@ -182,7 +171,7 @@ fn run_live_check(report: &mut SelftestReport, snapshot: &WorkspaceSnapshot) -> 
     let verify = world::verify_workspace(snapshot)?;
     report.check(
         "live restore back",
-        verify.accuracy >= 0.99,
+        verify.converged && journal.succeeded(&plan_back),
         format!(
             "accuracy {:.1}% after {} op(s)",
             verify.accuracy * 100.0,

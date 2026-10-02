@@ -1,151 +1,120 @@
 # workspace
 
-A macOS CLI that captures your desktop window layout and puts it back, exactly. Written in Rust.
+Save named window layouts on macOS and restore them from the terminal. Snapshots
+include window positions, displays, and tabs from Chromium browsers.
 
 ## Install
 
-```bash
-rustup toolchain install stable
-cargo build --release
-# binary: target/release/workspace
+From a checkout, with Rust installed:
+
+```sh
+cargo install --path .
 ```
 
-Grant two permissions once in **System Settings → Privacy & Security**:
+Grant **Accessibility** access in System Settings > Privacy & Security to move
+windows. **Screen Recording** lets macOS expose window titles, which helps with
+matching and browser tab capture. Run `workspace doctor` to check permissions
+and title visibility.
 
-- **Accessibility** — required to move windows (`restore`).
-- **Screen Recording** — required for window *titles*. Without it, save still works but matching degrades to geometry-only and browser-tab attribution falls back to window order. `workspace doctor` warns when titles are invisible.
+## Use
 
-## Quick Start
-
-```bash
-workspace save coding              # snapshot current layout
-workspace restore coding           # restore it
-workspace restore coding --dry-run # preview without touching the system
-workspace diff coding              # see what's different and what would change
-workspace list                     # all saved workspaces
+```sh
+workspace save coding
+workspace plan coding
+workspace restore coding
 ```
 
-## Commands
+`save` refuses to overwrite an existing snapshot unless you pass `--force`.
+Snapshots are JSON files in `~/Library/Application Support/workspace/`.
 
-| Command | What it does |
-|---|---|
-| `save <name>` | Capture visible windows, geometry, displays, browser tabs. `--force` to overwrite. |
-| `restore <name>` | **Plan → execute → verify** with a journal. `--converge N` re-plans until convergence, then replays saved z-order. |
-| `plan <name>` | Show the operations `restore` would run, without doing them. |
-| `verify <name>` | Compare the live world to a snapshot; reports accuracy & geometry drift. |
-| `diff <name>` | `plan` and `verify` together. |
-| `list` / `inspect <name>` / `delete <name>` | Manage snapshots. |
-| `configure <name>` | Enable/disable specific windows in a snapshot. |
-| `doctor` | Check Accessibility, Screen Recording (via title visibility), data dir, displays. |
-| `selftest [--live]` | Exercise the real pipeline end-to-end; `--live` briefly moves one window and restores it. |
-| `completions <shell>` | Print shell completion script (bash/zsh/fish/powershell/elvish). |
+To check a layout before changing anything:
 
-Global flags: `--json` (machine-readable), `--verbose` (debug tracing).
-
-## Restore Modes
-
-Pass `--mode` to `restore`, `plan`, or `diff`:
-
-- **`safe`** (default): only repositions, launches, and creates windows. Never minimizes or closes anything.
-- **`reconcile`**: may minimize extra windows of apps being restored.
-- **`destructive`**: may close extra windows. Also reachable via `--destructive`.
-
-`--dev-mode` additionally protects VS Code and Cursor from destructive lifecycle actions — useful when you're driving the CLI from inside your editor.
-
-## Convergence
-
-```bash
-workspace restore coding --converge 3
+```sh
+workspace restore coding --dry-run
+workspace diff coding
 ```
 
-Each iteration: re-observe the world → plan → execute → verify. Stops early on 100% match or when the plan has nothing actionable left.
+`restore` prints a journal of attempted operations and a geometry check.
+`--converge 3` allows up to three restore passes, observing the windows again
+between passes. `--json` writes command output as JSON; diagnostics go to stderr.
+Restore stops early when every restorable window is visible and within two points
+of its target frame, and the planned actions report success.
 
-## Output: The Journal
+Use `list`, `inspect`, and `delete` to manage snapshots. `configure coding` selects
+which saved windows to restore. `workspace --help` lists the commands, and
+`workspace restore --help` describes the restore options.
 
-`restore` prints (or emits as JSON with `--json`) an **execution journal** — one entry per planned op with status, duration, attempts, and a message:
+## Restore behavior
 
-```
-[  0] [OK  ] reposition     Code (12 ms) — repositioned
-[  1] [OK  ] chrome_tabs    Google Chrome (418 ms) — restored 1 browser window(s)
-[  2] [SKIP] skip           Calendar (0 ms) — this app is not in the supported restore allowlist yet
-```
+The default mode, `safe`, moves matching windows and can launch apps or create
+windows. It leaves extra windows open. Other modes also clean up extra windows
+belonging to apps in the snapshot:
 
-Status: `OK` (success), `PART` (partial — op ran but post-condition not observed), `SKIP`, `FAIL`.
-
-## How It Works
-
-```
-save:   CGWindowList (+ AX fullscreen flags, browser tabs) → filter
-        → JSON snapshot (~/Library/Application Support/workspace/<name>.json)
-restore: load snapshot → observe live world (CG windows + AX minimized windows)
-        → planner builds RestorePlan → Executor runs ops
-        (AX move/resize, NSWorkspace launch, JXA for browser tabs)
-        → Journal records every step → verify checks the result
-        → saved z-order replayed
+```sh
+workspace restore coding --mode reconcile    # minimize extra windows
+workspace restore coding --mode destructive  # close extra windows
 ```
 
-The planner is a pure function (`plan::plan_restore`) over snapshot + observed world. The executor is a trait with two impls:
+Cleanup runs only when that app's restore operations report success. Disabled
+and fullscreen saved windows are skipped. `--dev-mode` skips launching VS Code
+and Cursor and leaves their extra windows alone; matched editor windows can
+still be moved.
 
-- `MacOsExecutor` — drives real AX / NSWorkspace / browser scripting
-- `SimulatedExecutor` — pure in-memory; powers tests and `--dry-run`
+Windows are matched by app, title, and geometry. Execution resolves each selected
+live window once and keeps its handle or browser ID. Missing or ambiguous
+identities are skipped. This matching is heuristic, especially when titles are
+unavailable.
+Reuse requires title agreement or a close geometry match to the saved frame or
+its remapped target. Missing, blank, or changed titles need that geometry match.
 
-Because the unit suite runs against the simulation, `workspace selftest` (and `cargo test --test live_smoke -- --ignored`) exists to prove the *real* executor works on your machine — run it before trusting a new build.
+When a saved display is missing or its layout changes, window geometry is
+remapped onto the current displays. The saved coordinates may no longer fit.
 
-### Window matching
+## Limits
 
-Saved windows are matched to live windows by bundle id, title similarity, and geometry, globally best-pair-first. When titles are unavailable (no Screen Recording permission), only near-exact geometry counts as identity — a weak match will never relocate or rewrite some other window of the same app.
+Snapshots store window titles and geometry. They do not contain editor projects,
+documents, or terminal sessions; reopening that context is left to the app.
+Restore is limited to the apps listed in [src/app_support.rs](src/app_support.rs);
+other apps can be captured but are skipped during restore.
 
-## Multi-Monitor
+Chromium browsers support tab capture and restore. Existing windows keep their
+tabs, and missing saved URLs are reopened. New windows are created for unmatched
+saved windows, preserving existing blank windows. URLs that have redirected can
+be reopened as duplicates. Without window titles, capture falls back to window
+order and can attach the wrong tabs. Safari windows can be moved, but their tabs
+are not captured.
 
-If a saved display is still present with the same identity, pixels are exact. Otherwise windows are remapped proportionally onto the closest matching current display (stable id → numeric id → area/aspect/primary).
-
-## Supported Apps
-
-The restore allowlist (others are captured but skipped during restore):
-
-VS Code, Cursor, Xcode, Terminal, iTerm2, Warp, Finder, Notes, Music, Messages, Safari, and the Chromium family — Chrome, Chrome Canary, Brave, Edge, Chromium.
-
-**Browser tabs**: Chromium-family browsers get per-window tab capture and restore. On `restore`, a matched browser window that lost some saved tabs gets them re-opened (add-only — nothing you have open is closed), guarded so tabs are never grafted onto an unrelated window. Safari windows are repositioned but tabs are not captured (different scripting model).
-
-Add an app in [src/app_support.rs](src/app_support.rs); add fixture coverage in [tests/](tests).
-
-## Snapshot Format
-
-Pretty JSON, atomic writes, restricted name charset (`[A-Za-z0-9._-]`). Schema-versioned; newer-schema files are refused with exit code 7.
+Capture includes visible windows on the current desktop. Restore can also find
+minimized windows through Accessibility, but capture does not include windows
+on other Spaces. Verification checks matching, visibility, and geometry. JSON
+reports include `converged` and each matched window's `observed_minimized` state.
+Verification does not check tab state or app content. Restoring the saved
+stacking order is best effort.
 
 ## Development
 
-```bash
-cargo fmt
-cargo test                                   # 65+ tests: unit, integration, property-based
+```sh
+cargo fmt --check
+cargo test
+node tests/browser_behavior.cjs
 cargo clippy --all-targets -- -D warnings
-cargo test --test live_smoke -- --ignored    # real-executor smoke test (moves a window!)
+cargo build --release
 ```
 
-Architecture:
+The Rust tests use in-memory windows. The Node.js checks run the browser scripts
+against fake browser objects. Neither moves windows on your desktop.
 
-```
-src/cli.rs            clap definitions
-src/lib.rs            command routing + restore loop
-src/capture.rs        save orchestration (CG + AX enrichment + browser tabs)
-src/plan.rs           pure planner (snapshot + world → RestorePlan)
-src/execute.rs        Executor trait, MacOsExecutor, SimulatedExecutor, ExecutionJournal
-src/world.rs          world observation, display remapping, z-order replay, doctor
-src/verify.rs         compare live world to snapshot (same matcher as the planner)
-src/selftest.rs       end-to-end checks against the real machine
-src/storage.rs        atomic JSON read/write
-src/macos/*           AX, NSWorkspace, CoreGraphics, browser JXA
-tests/plan_properties.rs   proptest invariants (idempotency, safe-mode, convergence)
-tests/live_smoke.rs        ignored-by-default real-executor test
+For a manual check with Accessibility permission granted:
+
+```sh
+workspace selftest --live
+# or: cargo test --test live_smoke -- --ignored
 ```
 
-## Limitations
+This moves a window and restores the snapshot. Leave `--live` off to check
+capture, planning, and verification without moving windows.
 
-- macOS only.
-- `restore` requires Accessibility permission; reliable matching wants Screen Recording too.
-- Unknown apps are skipped (allowlist-only by design).
-- Fullscreen windows (detected via AX at save time) are captured but not restored.
-- Minimized windows are observed via AX and un-minimized when repositioned, but windows on other Spaces are invisible to capture.
-- Browser tab reconciliation matches exact URLs; a tab that redirected since capture may be re-opened as a duplicate.
-- Safari tabs are not captured.
-- Z-order replay is best-effort (activation-based).
+The planner lives in [src/plan.rs](src/plan.rs), execution in
+[src/execute.rs](src/execute.rs), and the platform calls in
+[src/macos/](src/macos/). [src/world.rs](src/world.rs) handles observation and
+display remapping. The planner and verifier share the window matcher.
